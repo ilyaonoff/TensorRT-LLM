@@ -43,12 +43,6 @@ class EmbeddingSession(object):
     cuda_graph_mode: bool
     dtype: trt.DataType
     debug_tensors_to_save: None
-    num_medusa_tokens: int = 0
-    medusa_topks: List[int] = None
-    medusa_paths: List[List[int]] = None
-    medusa_tree_ids: List[int] = None
-    medusa_position_offsets: List[int] = None
-    medusa_temperature: float = 0.0
 
     def __init__(self,
                  model_config: ModelConfig,
@@ -74,10 +68,6 @@ class EmbeddingSession(object):
         self.debug_tensors_to_save = debug_tensors_to_save
 
         self.cuda_graph_mode = cuda_graph_mode
-        # Optional inputs for dynamic decoder
-        self.top_p_decay = None
-        self.top_p_min = None
-        self.top_p_reset_ids = None
         # TODO: in tensorrt_llm/cpp/tensorrt_llm/thop/dynamicDecodeOp.cpp it's T, can be float or half?
         self.embedding_bias_opt = None
         # use one more block in paged kv cache.
@@ -125,10 +115,6 @@ class EmbeddingSession(object):
         #             "Logits dtype not supported by decoder. Falling back to float32. You may want to change the logits dtype to float16 in your model definition."
         #         )
         #         self.decoder_logits_dtype = torch.float32
-        #     self.dynamic_decoder = torch.classes.trtllm.DynamicDecodeOp(
-        #         model_config.max_batch_size, model_config.max_beam_width,
-        #         self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
-        #         self.mapping.pp_size, self.decoder_logits_dtype)
 
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
             set_peer_access(self.mapping)
@@ -400,18 +386,6 @@ class EmbeddingSession(object):
         return self._model_config.lora_plugin
 
     @property
-    def is_medusa_mode(self):
-        return self.num_medusa_heads > 0
-
-    @property
-    def max_medusa_tokens(self):
-        return self._model_config.max_medusa_tokens
-
-    @property
-    def num_medusa_heads(self):
-        return self._model_config.num_medusa_heads
-
-    @property
     def paged_state(self):
         return self._model_config.paged_state
 
@@ -653,28 +627,7 @@ class EmbeddingSession(object):
             dtype=torch.int32,
             device=self.device)
 
-        if self.is_medusa_mode:
-            self.new_tokens = torch.zeros(
-                [batch_size, self.num_medusa_tokens + 1],
-                dtype=torch.int32,
-                device=self.device)
-            self.generation_input_ids = torch.zeros(
-                [batch_size, self.num_medusa_tokens + 1],
-                dtype=torch.int32,
-                device=self.device)
-            self.medusa_output_tokens = torch.zeros(
-                [batch_size, self.num_medusa_tokens],
-                dtype=torch.int32,
-                device=self.device)
-            self.accept_lengths = torch.ones([batch_size],
-                                             dtype=torch.int32,
-                                             device=self.device)
-            if self.medusa_temperature != 0:
-                self.medusa_output_logits = torch.empty(
-                    [batch_size, self.num_medusa_heads, self.vocab_size_padded],
-                    dtype=self._tensor_dtype('logits'),
-                    device=self.device)
-        elif scfg.num_beams > 1:
+        if scfg.num_beams > 1:
             self.new_tokens = torch.zeros([batch_size, scfg.num_beams, 1],
                                           dtype=torch.int32,
                                           device=self.device)
@@ -758,60 +711,6 @@ class EmbeddingSession(object):
         dtype = trt_dtype_to_torch(self.runtime.engine.get_tensor_dtype(name))
         return dtype
 
-    def _init_medusa(self, medusa_choices: List[List[int]]):
-        from tensorrt_llm.runtime.medusa_utils import (_medusa_setup,
-                                                       expand_choices_if_needed)
-        medusa_choices = expand_choices_if_needed(medusa_choices)
-        self.num_medusa_tokens = len(medusa_choices)
-        assert self.num_medusa_tokens > 0 and self.num_medusa_tokens <= self.max_medusa_tokens
-        medusa_info = _medusa_setup(medusa_choices, self.num_medusa_heads)
-        self.medusa_topks = medusa_info.medusa_topks
-        self.medusa_mask = medusa_info.medusa_mask[1:, 1:].to(
-            torch.bool
-        )  # convert to bool, original mask includes true token as well
-
-        # Expand medusa position offsets to number of batch size in order to be compatible with the new Medusa.
-        target_shape = list(medusa_info.medusa_packed_mask.unsqueeze(0).shape)
-        target_shape[0] = self.batch_size
-        # Note: medusa_packed_mask has no paddings in the first dimension.
-        self.medusa_packed_mask = medusa_info.medusa_packed_mask.unsqueeze(
-            0).expand(target_shape).reshape(-1, target_shape[-1]).cuda()
-
-        self.medusa_paths = medusa_info.medusa_paths
-        self.medusa_tree_ids = medusa_info.medusa_tree_ids
-
-        # Expand medusa position offsets to number of batch size in order to be compatible with the new Medusa.
-        target_shape = list(
-            medusa_info.medusa_position_offsets.unsqueeze(0).shape)
-        target_shape[0] = self.batch_size
-        # Note: medusa_position_offsets still keeps the paddings in order to get max_gen_input_length from the shape info.
-        self.medusa_position_offsets = medusa_info.medusa_position_offsets.unsqueeze(
-            0).expand(target_shape).int().cuda()
-        # Fixed sequence lengths currently.
-        # Support variable sequence lengths later.
-        self.spec_decoding_generation_lengths = (torch.ones(
-            (self.batch_size)) * (self.num_medusa_tokens + 1)).int().cuda()
-        if not self.use_gpt_attention_plugin:
-            medusa_fp_mask = torch.zeros_like(self.medusa_mask,
-                                              dtype=torch.float32)
-            medusa_fp_mask[torch.logical_not(self.medusa_mask)] = float('-inf')
-            self.medusa_mask = medusa_fp_mask
-        return
-
-    def _get_num_paged_blocks(self, max_attention_window_size,
-                              sink_token_length, use_one_more_block):
-        bubble_len = 0
-        if sink_token_length % self.tokens_per_block > 0:
-            bubble_len += (self.tokens_per_block -
-                           sink_token_length % self.tokens_per_block)
-        max_blocks_per_seq = math.ceil(
-            (max_attention_window_size + bubble_len) / self.tokens_per_block)
-        if use_one_more_block:
-            max_blocks_per_seq += 1
-        num_blocks = self.batch_size * self.beam_width * max_blocks_per_seq
-
-        return num_blocks, max_blocks_per_seq
-
     def setup(self,
               batch_size: int,
               max_context_length: int,
@@ -829,8 +728,6 @@ class EmbeddingSession(object):
         self.max_context_length = max_context_length
         self.max_new_tokens = max_new_tokens
         self.max_seq_length = max_context_length + max_new_tokens
-        if medusa_choices is not None:
-            self.max_seq_length += self._model_config.max_medusa_tokens
         self.beam_width = beam_width
         self.encoder_max_input_length = encoder_max_input_length
         if max_attention_window_size is None:
@@ -890,40 +787,15 @@ class EmbeddingSession(object):
             self.paged_kv_cache and beam_width > 1
             and self.max_seq_length > self.max_attention_window_size)
         self.lora_manager = lora_manager
-        if medusa_choices is not None:
-            self._init_medusa(medusa_choices)
 
         self.buffer = {}
         if self.mapping.is_last_pp_rank():
-            if self.is_medusa_mode:
-                self.buffer['logits'] = torch.empty(
-                    (batch_size, self.num_medusa_tokens + 1,
-                     self.vocab_size_padded)
-                    if not self.gather_context_logits else
-                    (batch_size, max_context_length, self.vocab_size_padded),
-                    dtype=self._tensor_dtype('logits'),
-                    device=self.device)
-                medusa_logits_shape = (self.num_medusa_heads, batch_size,
-                                       (self.num_medusa_tokens + 1),
-                                       self.vocab_size_padded)
-                if self.remove_input_padding:
-                    medusa_logits_shape = (self.num_medusa_heads, batch_size *
-                                           (self.num_medusa_tokens + 1),
-                                           self.vocab_size_padded)
-
-                self.buffer['medusa_logits'] = torch.empty(
-                    medusa_logits_shape if not self.gather_context_logits else
-                    (self.num_medusa_heads, batch_size, max_context_length,
-                     self.vocab_size_padded),
-                    dtype=self._tensor_dtype('medusa_logits'),
-                    device=self.device)
-            else:
-                self.buffer['embeddings_output'] = torch.empty(
-                    (batch_size, 4096) # TODO(ilyaonoff)
-                    if not self.gather_context_logits else
-                    (batch_size, max_context_length, self.vocab_size_padded),
-                    dtype=self._tensor_dtype('embeddings_output'),
-                    device=self.device)
+            self.buffer['embeddings_output'] = torch.empty(
+                (batch_size, 4096) # TODO(ilyaonoff)
+                if not self.gather_context_logits else
+                (batch_size, max_context_length, self.vocab_size_padded),
+                dtype=self._tensor_dtype('embeddings_output'),
+                device=self.device)
 
         if self.cross_attention:
             # use shape info to pass max length info in remove padding mode
@@ -1075,15 +947,7 @@ class EmbeddingSession(object):
                     self._model_config.num_layers,
                 ))
 
-        if self.is_medusa_mode:
-            self.buffer['spec_decoding_packed_mask'] = self.medusa_packed_mask
-            self.buffer[
-                'spec_decoding_position_offsets'] = self.medusa_position_offsets
-            self.buffer[
-                'spec_decoding_generation_lengths'] = self.spec_decoding_generation_lengths
         self.buffer_allocated = True
-        if self.is_medusa_mode:
-            return self.num_medusa_tokens
 
     def _get_context_shape_buffer(
             self,
@@ -1159,9 +1023,6 @@ class EmbeddingSession(object):
 
         if self.mapping.is_last_pp_rank():
             add_tensor(self.buffer['embeddings_output'], 'embeddings_output')
-            # add_tensor(self.buffer['logits'], 'logits')
-            if self.is_medusa_mode:
-                add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
 
             if not self.gather_context_logits or self.has_rnn_layers:
                 add_tensor(last_token_ids, 'last_token_ids')
@@ -1338,309 +1199,6 @@ class EmbeddingSession(object):
             if self.cross_attention and self.remove_input_padding:
                 add_tensor(encoder_input_lengths.to('cpu'),
                            'host_encoder_input_lengths')
-        if self.is_medusa_mode:
-            # Medusa mask and position offsets are fixed for the whole session.
-            add_tensor(self.buffer['spec_decoding_packed_mask'],
-                       'spec_decoding_packed_mask')
-            add_tensor(self.buffer['spec_decoding_position_offsets'],
-                       'spec_decoding_position_offsets')
-            add_tensor(self.buffer['spec_decoding_generation_lengths'],
-                       'spec_decoding_generation_lengths')
-
-        return tensors
-
-    def _get_next_step_shape_buffer(
-            self,
-            batch_size: int,
-            beam_width: int,
-            max_context_length: int,
-            step: int,
-            context_lengths: torch.Tensor,
-            host_context_lengths: torch.Tensor,
-            position_ids: torch.Tensor,
-            last_token_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
-            cross_attention_mask: torch.Tensor,
-            cache_indirection: torch.Tensor,
-            kv_cache_block_offsets: torch.Tensor,
-            host_kv_cache_block_offsets: torch.Tensor,
-            cross_kv_cache_block_offsets: torch.Tensor = None,
-            host_cross_kv_cache_block_offsets: torch.Tensor = None,
-            hidden_states_input: torch.Tensor = None,
-            prompt_embedding_table: torch.Tensor = None,
-            tasks: torch.Tensor = None,
-            prompt_vocab_size: torch.Tensor = None,
-            encoder_output: torch.Tensor = None,
-            encoder_input_lengths: torch.Tensor = None):
-        tensors = {}  # Dict[str, RuntimeTensor]
-
-        def sym(x, name):
-            return RuntimeTensor.from_torch(name, x)
-
-        def add_tensor(x, name):
-            return tensors.update({name: sym(x, name)})
-
-        def add_tensor_with_shape(x, name, shape):
-            return tensors.update(
-                {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
-
-        context_lengths_local = context_lengths.clone()
-        host_context_lengths_local = host_context_lengths.clone()
-        if self.has_attn_layers:
-            if self.use_gpt_attention_plugin:
-                add_tensor(context_lengths_local, 'context_lengths')
-            add_tensor(cache_indirection, 'cache_indirection')
-            if self.has_position_embedding:
-                add_tensor(position_ids, 'position_ids')
-
-        if self.mapping.has_pp():
-            hidden_size = self.hidden_size * self.mapping.tp_size
-            shape = (batch_size * beam_width,
-                     hidden_size) if self.remove_input_padding else (
-                         batch_size * beam_width, 1, hidden_size)
-            hidden_states_input = hidden_states_input.resize_(*shape)
-
-        if self.mapping.is_last_pp_rank():
-            add_tensor(self.buffer['logits'], 'logits')
-            if self.is_medusa_mode:
-                add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
-
-            if not self.gather_context_logits or self.has_rnn_layers:
-                add_tensor(last_token_ids, 'last_token_ids')
-        else:
-            add_tensor(hidden_states_input, 'hidden_states_output')
-
-        if self.mapping.is_first_pp_rank():
-            input_ids_shape = (
-                batch_size * beam_width * (self.num_medusa_tokens + 1),
-            ) if self.remove_input_padding else (batch_size * beam_width,
-                                                 self.num_medusa_tokens + 1)
-            if self.is_medusa_mode:
-                add_tensor_with_shape(self.generation_input_ids, 'input_ids',
-                                      input_ids_shape)
-            else:
-                add_tensor_with_shape(self.new_tokens, 'input_ids',
-                                      input_ids_shape)
-        else:
-            add_tensor(hidden_states_input, 'hidden_states_input')
-
-        if self.cross_attention:
-            if self.use_gpt_attention_plugin:
-                # disable (or minimize) cross qkv computation at generation phase
-                if self.skip_cross_qkv:
-                    # disable
-                    encoder_output_shape = encoder_output.shape
-                    add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
-                else:
-                    # minimize
-                    # use TensorRT Empty Tensor to skip redundant computation
-                    # 0 for generation phase, >0 for context phase
-                    encoder_output_shape = [
-                        0, encoder_output.shape[-1]
-                    ] if self.remove_input_padding else [
-                        1, 0, encoder_output.shape[-1]
-                    ]
-            else:
-                # OOTB path doesn't have kv cache for now, so this encoder_output is
-                # a must-have input. We just use the encoder_output
-                encoder_output_shape = encoder_output.shape
-
-            # in generation phase, cross kv cache is already filled during context phase, set to False
-            add_tensor(torch.zeros(1, dtype=torch.bool, device=self.device),
-                       'cross_kv_cache_gen')
-            add_tensor_with_shape(encoder_output, 'encoder_output',
-                                  encoder_output_shape)
-            add_tensor(encoder_input_lengths, 'encoder_input_lengths')
-            add_tensor(self.buffer['encoder_max_input_length'],
-                       'encoder_max_input_length')
-            if not self.use_gpt_attention_plugin:
-                add_tensor(cross_attention_mask, 'cross_attention_mask')
-
-        if self.paged_kv_cache and self.has_attn_layers:
-            shape = kv_cache_block_offsets.shape
-            shape = [shape[0] * shape[1], *shape[2:]]
-            add_tensor_with_shape(kv_cache_block_offsets,
-                                  f'kv_cache_block_offsets', shape)
-            add_tensor_with_shape(host_kv_cache_block_offsets,
-                                  f'host_kv_cache_block_offsets', shape)
-            pool_pointers = f'host_kv_cache_pool_pointers'
-            add_tensor(self.buffer[pool_pointers], pool_pointers)
-            if self.cross_attention:
-                cross_shape = cross_kv_cache_block_offsets.shape
-                cross_shape = [
-                    cross_shape[0] * cross_shape[1], *cross_shape[2:]
-                ]
-                add_tensor_with_shape(cross_kv_cache_block_offsets,
-                                      f'cross_kv_cache_block_offsets',
-                                      cross_shape)
-                add_tensor_with_shape(host_cross_kv_cache_block_offsets,
-                                      f'host_cross_kv_cache_block_offsets',
-                                      cross_shape)
-                cross_pool_pointers = f'host_cross_kv_cache_pool_pointers'
-                add_tensor(self.buffer[cross_pool_pointers],
-                           cross_pool_pointers)
-
-        if prompt_embedding_table is not None:
-            add_tensor(prompt_embedding_table, 'prompt_embedding_table')
-
-            if self.remove_input_padding:
-                gen_tasks = tasks
-            else:
-                gen_tasks = tasks.unsqueeze(-1)
-            add_tensor(gen_tasks, 'tasks')
-            add_tensor(prompt_vocab_size, 'prompt_vocab_size')
-
-        if not self.paged_kv_cache:
-            attn_layer_idx = 0
-            for idx in range(self.first_layer, self.last_layer):
-                if not self.use_gpt_attention_plugin and self.layer_types[
-                        idx] == 'attention':
-                    next_shape = (batch_size * beam_width, 2, self.num_heads_kv,
-                                  max_context_length + step, self.head_size)
-                    # We will make current layer's output KV-cache overwrite previous layers input KV-cache
-                    # buffer id: ...  5,  6,  7,  8,  9, ...
-                    # layer n:        out in
-                    # layer n+1:          out in
-                    # layer n+2               out in
-                    # And when finish a step, we will make every layer's in/out buffer index subtract 1 in
-                    # a circular buffer way to make sure current outputs become next step's inputs.
-                    buffer_num = self.num_attn_layers + 1  # attention layer num + 1 extra buffer.
-                    # Subtract 1 for every step.
-                    input_ind = attn_layer_idx - (step % buffer_num)
-                    # When underflow, go to the back to achieve a circular buffers.
-                    if input_ind < 0:
-                        input_ind = self.num_attn_layers + 1 + input_ind
-                    # Output buffer is just before input buffer. When input is buffer 0, output should use the back buffer to achieve circular buffers.
-                    output_ind = input_ind - 1 if input_ind > 0 else self.num_attn_layers
-
-                    # We only allocate layer num of normal buffers. If index is overflow, use the extra buffer.
-                    input_name = f'present_key_value_{self.attn_to_general_idx[input_ind]}' if input_ind != self.num_attn_layers \
-                        else f'1_present_key_value_{self.attn_to_general_idx[0]}'
-                    output_name = f'present_key_value_{self.attn_to_general_idx[output_ind]}' if output_ind != self.num_attn_layers \
-                        else f'1_present_key_value_{self.attn_to_general_idx[0]}'
-                    attn_layer_idx += 1
-
-                    add_tensor_with_shape(self.buffer[input_name],
-                                          f'past_key_value_{idx}', next_shape)
-                    add_tensor(self.buffer[output_name],
-                               f'present_key_value_{idx}')
-                elif self.layer_types[idx] == 'attention':
-                    key_value_cache = self.buffer[f'present_key_value_{idx}']
-                    add_tensor(key_value_cache, f'past_key_value_{idx}')
-                    add_tensor(key_value_cache, f'present_key_value_{idx}')
-
-                    if self.cross_attention:
-                        cross_cache_buffer = self.buffer[
-                            f'cross_present_key_value_{idx}']
-                        add_tensor(cross_cache_buffer,
-                                   f'cross_past_key_value_{idx}')
-                        add_tensor(cross_cache_buffer,
-                                   f'cross_present_key_value_{idx}')
-
-        for idx in range(self.first_layer, self.last_layer):
-            if self.layer_types[idx] != 'recurrent':
-                continue
-            if self.paged_state:
-                add_tensor(self.buffer[f'conv_state_ptr_{idx}'],
-                           f'conv_state_ptr_{idx}')
-                add_tensor(self.buffer[f'rnn_state_ptr_{idx}'],
-                           f'rnn_state_ptr_{idx}')
-            else:
-                # conv state
-                if self.use_mamba_conv1d_plugin:
-                    conv_state_shape = (batch_size, self.conv_kernel - 1,
-                                        self.rnn_hidden_size)
-                else:
-                    conv_state_shape = (batch_size, self.rnn_hidden_size,
-                                        self.conv_kernel - 1)
-                if step % 2:
-                    add_tensor_with_shape(
-                        self.buffer[f'1_present_conv_state_{idx}'],
-                        f'past_conv_state_{idx}', conv_state_shape)
-                    add_tensor(self.buffer[f'present_conv_state_{idx}'],
-                               f'present_conv_state_{idx}')
-                else:
-                    add_tensor_with_shape(
-                        self.buffer[f'present_conv_state_{idx}'],
-                        f'past_conv_state_{idx}', conv_state_shape)
-                    add_tensor(self.buffer[f'1_present_conv_state_{idx}'],
-                               f'present_conv_state_{idx}')
-                # rnn state
-                rnn_state = self.buffer[f'present_rnn_state_{idx}']
-                add_tensor(rnn_state, f'past_rnn_state_{idx}')
-                add_tensor(rnn_state, f'present_rnn_state_{idx}')
-
-        if self.paged_state and self.has_rnn_layers:
-            slot_mapping = torch.arange(0,
-                                        batch_size,
-                                        device='cuda',
-                                        dtype=torch.int32)
-            add_tensor(slot_mapping, 'slot_mapping')
-
-        if self.use_gpt_attention_plugin and self.has_attn_layers:
-            # generation requests
-            host_request_types = torch.ones_like(context_lengths,
-                                                 device='cpu').int()
-            if self.is_medusa_mode:
-                host_past_key_value_lengths = self.sequence_length_buffer.cpu()
-            else:
-                # previous [past_kv_length, is_context] has been deprecated. only past_kv_length should be given here
-                # Note we should use max_context_length here to align to max -- but isn't this done in attn plugin's max_element() already?
-                host_past_key_value_lengths = torch.tensor(
-                    [max_context_length + step] * (batch_size * beam_width),
-                    dtype=torch.int32,
-                    device='cpu')
-            add_tensor(host_past_key_value_lengths,
-                       'host_past_key_value_lengths')
-            add_tensor(host_request_types, 'host_request_types')
-            # Sequence lengths are not used in the context phase actually.
-            sequence_length = self.sequence_length_buffer
-            add_tensor_with_shape(sequence_length, 'sequence_length',
-                                  (batch_size * beam_width, ))
-            add_tensor_with_shape(self.host_sink_token_length,
-                                  'host_sink_token_length', (1, ))
-            add_tensor_with_shape(self.host_max_attention_window_sizes,
-                                  f'host_max_attention_window_sizes',
-                                  (self.num_attn_layers, ))
-            if self.remove_input_padding:
-                add_tensor(host_context_lengths_local, 'host_context_lengths')
-        else:
-            if self.has_rnn_layers:
-                host_request_types = torch.ones_like(context_lengths,
-                                                     device='cpu').int()
-                add_tensor(host_request_types, 'host_request_types')
-                if self.use_mamba_conv1d_plugin and self.remove_input_padding:
-                    add_tensor(host_context_lengths_local,
-                               'host_context_lengths')
-            if self.has_attn_layers:
-                add_tensor(attention_mask, 'attention_mask')
-
-        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
-            add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
-
-        # Since we are using a ping-pong context design and the lora weight remains constant within the same request,
-        # it is only necessary to set the lora weight for the first two steps.
-        if self.use_lora_plugin and step < 2:
-            for idx in range(self.num_layers):
-                layer_idx = idx + self.first_layer
-                for lora_module in (self.lora_target_modules +
-                                    self.missing_qkv_modules):
-                    lora_ranks = f'{lora_module}_lora_ranks_{layer_idx}'
-                    add_tensor(self.buffer[lora_ranks], lora_ranks)
-                    lora_module = f'{lora_module}_lora_weights_pointers_{layer_idx}'
-                    add_tensor(self.buffer[lora_module], lora_module)
-            if self.cross_attention and self.remove_input_padding:
-                add_tensor(encoder_input_lengths.to('cpu'),
-                           'host_encoder_input_lengths')
-
-        if self.is_medusa_mode:
-            # Medusa mask and position offsets are fixed for the whole session.
-            add_tensor(self.buffer['spec_decoding_packed_mask'],
-                       'spec_decoding_packed_mask')
-            add_tensor(self.buffer['spec_decoding_position_offsets'],
-                       'spec_decoding_position_offsets')
-            add_tensor(self.buffer['spec_decoding_generation_lengths'],
-                       'spec_decoding_generation_lengths')
 
         return tensors
 
@@ -1649,10 +1207,6 @@ class EmbeddingSession(object):
                                 remove_input_padding, **kwargs):
 
         last_token_ids = context_lengths.detach().clone()
-        if self.is_medusa_mode and not remove_input_padding:
-            # For Medusa, last_token_ids should contain the actual indices
-            last_token_ids = last_token_ids - 1  # sub 1 from context_lengths for indices
-            last_token_ids = last_token_ids.reshape([batch_size, -1])
         if (use_gpt_attention_plugin
                 or self.has_rnn_layers) and remove_input_padding:
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
@@ -1682,53 +1236,6 @@ class EmbeddingSession(object):
                 position_ids.masked_fill_(attention_mask == 0, 1)
                 position_ids = position_ids.int()
                 ret['attention_mask'] = attention_mask
-
-        if self.has_position_embedding and self.has_attn_layers:
-            ret['position_ids'] = position_ids
-
-        return ret
-
-    def _prepare_generation_inputs(self, batch_size, context_lengths,
-                                   use_gpt_attention_plugin,
-                                   remove_input_padding, **kwargs):
-
-        last_token_ids = torch.ones_like(context_lengths)
-        if use_gpt_attention_plugin and self.is_medusa_mode:
-            if remove_input_padding:
-                # For Medusa, last_token_ids should be [bs * seq] and should contain the actual indices (starts from 1)
-                last_token_ids = torch.ones(self.num_medusa_tokens + 1,
-                                            dtype=torch.int32,
-                                            device=context_lengths.device)
-                last_token_ids = last_token_ids.expand([batch_size,
-                                                        -1]).reshape(-1)
-            else:
-                # For Medusa, last_token_ids should be [bs, seq] and should contain the actual indices (starts from 0)
-                last_token_ids = torch.arange(self.num_medusa_tokens + 1,
-                                              dtype=torch.int32,
-                                              device=context_lengths.device)
-                last_token_ids = last_token_ids.expand([batch_size, -1])
-        if (use_gpt_attention_plugin
-                or self.has_rnn_layers) and remove_input_padding:
-            last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
-        ret = {'last_token_ids': last_token_ids}
-
-        if use_gpt_attention_plugin:
-            step = kwargs.pop('step')
-            position_ids = context_lengths + step
-            if not remove_input_padding:
-                position_ids = torch.unsqueeze(position_ids, 1)
-        elif self.has_attn_layers:
-            attention_mask = kwargs.pop('attention_mask')
-            num_beams = kwargs.pop('num_beams')
-            attention_mask = torch.cat((attention_mask,
-                                        attention_mask.new_ones(
-                                            (batch_size * num_beams, 1))),
-                                       dim=-1).contiguous()
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            position_ids = position_ids[:, -1].unsqueeze(-1)
-            position_ids = position_ids.int()
-            ret['attention_mask'] = attention_mask
 
         if self.has_position_embedding and self.has_attn_layers:
             ret['position_ids'] = position_ids
@@ -1767,143 +1274,6 @@ class EmbeddingSession(object):
             self.nccl_comm.recv(final_output_ids, self.mapping.pp_group[-1])
         return final_output_ids
 
-    def finalize_decoder(self,
-                         context_lengths,
-                         batch_size,
-                         beam_width,
-                         scfg,
-                         in_progress=False):
-        final_output_ids = None
-        if self.mapping.is_last_pp_rank():
-            # output shape of self.gather_tree: [batch_size, beam_width, output_len]
-            beam_hyps_args = [
-                self.beam_hyps_output_ids_cba, self.beam_hyps_seq_len_cba,
-                self.beam_hyps_cum_log_probs_cba,
-                self.beam_hyps_normed_scores_cba, self.beam_hyps_log_probs_cba,
-                self.beam_hyps_min_normed_scores, self.beam_hyps_num_beams,
-                self.beam_hyps_is_done
-            ]
-
-            if scfg.use_beam_hyps and in_progress:
-                # self.gather_tree modifies these args.
-                # In streaming mode, this results in incorrect decoding in the following steps.
-                beam_hyps_args = copy.deepcopy(beam_hyps_args)
-
-            final_output_ids = self.gather_tree(
-                self.sequence_length_buffer, self.output_ids, self.parent_ids,
-                self.end_ids, context_lengths, self.cum_log_probs,
-                self.log_probs, self.log_probs_tiled, *beam_hyps_args,
-                self.finished, self.length_penalty, batch_size, beam_width,
-                self.max_seq_length, scfg.use_beam_hyps)
-
-        # Communicate ranks in Pipeline Parallelism
-        if self.mapping.has_pp():
-            final_output_ids = self.pp_communicate_final_output_ids(
-                final_output_ids, batch_size, beam_width)
-
-        return final_output_ids
-
-    def find_best_medusa_path(self,
-                              batch_size,
-                              input_ids: torch.Tensor,
-                              next_logits,
-                              temp=0):
-        assert input_ids.shape[-1] == self.num_medusa_tokens + 1
-        best_path = [0] * batch_size
-        best_path_len = [1] * batch_size
-        next_tokens = [None] * batch_size
-        zero_pad = torch.zeros((batch_size, 1),
-                               dtype=input_ids.dtype,
-                               device=input_ids.device)
-        input_ids = torch.cat((input_ids, zero_pad), dim=-1)
-        if temp == 0:
-            new_tokens_raw = torch.argmax(
-                next_logits, dim=-1
-            )  # TODO: can be done by treating [bs, nT, vocab] as [bs*nT, vocab] and using decoderOp?
-            new_tokens = torch.cat((new_tokens_raw, zero_pad), dim=-1)
-            input_paths = [
-                input_ids[b, self.medusa_paths] for b in range(batch_size)
-            ]
-            new_paths = [
-                new_tokens[b, self.medusa_paths] for b in range(batch_size)
-            ]
-            for b in range(batch_size):
-                equality = input_paths[b][:, 1:] == new_paths[b][:, :-1]
-                paths_correct_len = torch.cumprod(equality.int(),
-                                                  dim=1).sum(dim=1)
-                best_path_len[b] = paths_correct_len.max().item() + 1
-                if best_path_len[b] > 1:
-                    best_path[b] = torch.argmax(paths_correct_len)
-                next_tokens[b] = new_paths[b][
-                    best_path[b]][:best_path_len[b]].clone()
-
-        return best_path, best_path_len, next_tokens
-
-    def filter_medusa_logits(self, batch_size, best_path, best_path_lengths,
-                             medusa_logits):
-        """
-            medusa_logits is of shape [nMH, bs, nMT+1, vocab]
-
-                Returns [nMH, bs, vocab]
-        """
-        filtered_logits = torch.empty(
-            (self.num_medusa_heads, batch_size, self.vocab_size_padded),
-            dtype=medusa_logits.dtype,
-            device=medusa_logits.device)
-        medusa_logits = medusa_logits.view(self.num_medusa_heads, batch_size,
-                                           self.num_medusa_tokens + 1, -1)
-        for b in range(batch_size):
-            idx = self.medusa_paths[best_path[b], best_path_lengths[b] - 1]
-            filtered_logits[:, b, ...] = medusa_logits[:, b, idx, ...]
-        return filtered_logits
-
-    def get_next_medusa_tokens(self, batch_size, next_medusa_logits):
-        next_medusa_tokens = [
-            torch.zeros((batch_size, 1),
-                        dtype=torch.int32,
-                        device=next_medusa_logits.device)
-        ]  # dummy token for now, TODO: update tree_ids and remove this
-        for i in range(self.num_medusa_heads):
-            medusa_token = torch.topk(next_medusa_logits[i, :, :],
-                                      self.medusa_topks[i],
-                                      dim=-1).indices
-            next_medusa_tokens.append(medusa_token)
-        next_medusa_tokens = torch.cat(next_medusa_tokens, dim=-1)
-        return next_medusa_tokens
-
-    def update_kv_cache_draft_token_location(self, batch_size, best_path,
-                                             best_path_len):
-        best_path_len_tensor = torch.tensor(best_path_len,
-                                            dtype=torch.int,
-                                            device='cuda')
-        accepted_draft_token_counts = best_path_len_tensor - 1
-        accepted_draft_token_offsets = torch.zeros(batch_size + 1,
-                                                   dtype=torch.int32,
-                                                   device='cuda')
-        accepted_draft_token_offsets[1:] = torch.cumsum(
-            accepted_draft_token_counts, dim=0)
-        accepted_draft_token_offsets_cpu = accepted_draft_token_offsets.to(
-            'cpu')
-        packed_accepted_draft_tokens_indices = torch.empty(
-            accepted_draft_token_offsets_cpu[batch_size],
-            dtype=torch.int32,
-            device='cuda')
-        for seq_idx in range(batch_size):
-            seq_start = accepted_draft_token_offsets_cpu[seq_idx]
-            seq_end = accepted_draft_token_offsets_cpu[seq_idx + 1]
-            seq_accepted_draft_count = seq_end - seq_start
-            best_path_idx = best_path[seq_idx].cpu() if isinstance(
-                best_path[seq_idx], torch.Tensor) else best_path[seq_idx]
-            seq_accepted_token_indices = self.medusa_paths[
-                best_path_idx, 1:1 + seq_accepted_draft_count]
-            packed_accepted_draft_tokens_indices[
-                seq_start:seq_end] = seq_accepted_token_indices - 1
-        self.kv_cache_updater.update(accepted_draft_token_offsets,
-                                     packed_accepted_draft_tokens_indices,
-                                     self.sequence_length_buffer,
-                                     self.num_medusa_tokens)
-        self.sequence_length_buffer += self.accept_lengths
-
     def update_output_ids_by_offset(self, new_generated_ids, offsets):
         # output_ids [batch_size, padded_input_length]
         # new_generated_ids [batch_size, padded_accepted_length]
@@ -1914,142 +1284,6 @@ class EmbeddingSession(object):
             self.output_ids[b, offsets[b]:(
                 offsets[b] + self.accept_lengths[b]
             )] = new_generated_ids[b][:self.accept_lengths[b]]
-
-    def next_medusa_input_ids(self):
-        # self.new_tokens [batch_size, padded_accepted_length]
-        # self.accept_lengths [batch_size]
-        # self.medusa_new_tokens [batch_size, num_medusa_tokens]
-        # FIXME: using fused kernel to generate the new medusa input ids.
-        batch_size = self.new_tokens.shape[0]
-        for b in range(batch_size):
-            self.generation_input_ids[b, 0] = self.new_tokens[
-                b, self.accept_lengths[b] - 1]
-            self.generation_input_ids[b, 1:] = self.medusa_output_tokens[b, :]
-
-    # OPTIMIZE: need to optimize this early-stop workflow.
-    def early_stop_criteria(self, batch_size, step, should_stop):
-        for b in range(batch_size):
-            if self.medusa_should_step[b]:
-                self.accept_lengths[b] = 0
-                continue
-            # output sequence length criteria.
-            prev_total_output_length = self.total_accept_lengths[b]
-            # end id criteria.
-            should_stop_with_end_id = torch.any(
-                self.new_tokens[b, :self.accept_lengths[b]] == self.end_ids[b])
-            end_id_pos = (self.new_tokens[b, :self.accept_lengths[b]] ==
-                          self.end_ids[b]).nonzero(as_tuple=True)[0]
-            self.medusa_should_step[b] = self.medusa_should_step[b] or (
-                prev_total_output_length + self.accept_lengths[b] >=
-                self.max_new_tokens) or should_stop_with_end_id
-            # update accept lengths for the current step.
-            if (prev_total_output_length + self.accept_lengths[b] >=
-                    self.max_new_tokens):
-                self.accept_lengths[b] = min(
-                    self.max_new_tokens - prev_total_output_length,
-                    self.accept_lengths[b])
-            if should_stop_with_end_id:
-                # get the position of first end_id.
-                self.accept_lengths[b] = min(end_id_pos[0] + 1,
-                                             self.accept_lengths[b])
-            self.total_accept_lengths[b] += self.accept_lengths[b]
-
-        should_stop[0] = should_stop[0] or (step == self.max_new_tokens -
-                                            1) or torch.all(
-                                                self.medusa_should_step)
-        return should_stop
-
-    def process_logits_for_medusa_mode(self, step, batch_size, input_ids,
-                                       logits, context_has_medusa_tokens,
-                                       next_step_buffer, context_lengths):
-        medusa_logits = self.buffer['medusa_logits']
-        best_path = None
-        best_path_lengths = None
-        should_stop = torch.tensor([False], dtype=bool)
-        if step == 0:
-            # logits buffer is of shape [bs, medusa_tokens+1, vocab]
-            # but during context phase, we get only [bs, 1, vocab] but contiguous
-            logits = logits.view(-1)[:batch_size * logits.shape[-1]].view(
-                batch_size, -1)
-            next_main_token_logits = logits.to(self.decoder_logits_dtype)
-            next_main_token = torch.argmax(next_main_token_logits,
-                                           dim=-1,
-                                           keepdim=True)
-            self.new_tokens = next_main_token
-            # NOTE: stop criteria.
-            self.medusa_should_step = torch.eq(self.new_tokens.reshape(-1),
-                                               self.end_ids)
-            if torch.equal(self.new_tokens.reshape(-1), self.end_ids):
-                # stop if context phase output EOS
-                should_stop[0] = True
-            # NOTE: only one token's medusa logit will be written in.
-            medusa_logits = medusa_logits.view(self.num_medusa_tokens + 1,
-                                               -1)[0, ...]
-            next_medusa_logits = medusa_logits.reshape(
-                self.num_medusa_heads, batch_size,
-                -1).to(self.decoder_logits_dtype)
-            next_medusa_tokens = self.get_next_medusa_tokens(
-                batch_size, next_medusa_logits)
-            self.medusa_output_tokens = next_medusa_tokens[:, self.medusa_tree_ids[
-                -self.num_medusa_tokens:]]
-            self.accept_lengths = torch.ones([batch_size],
-                                             dtype=torch.int32,
-                                             device=self.device)
-            self.total_accept_lengths = self.accept_lengths.clone()
-        else:
-            next_token_logits = logits.to(self.decoder_logits_dtype)
-
-            best_path, best_path_lengths, next_main_tokens = self.find_best_medusa_path(
-                batch_size, self.generation_input_ids.view(batch_size, -1),
-                next_token_logits.view(batch_size, self.num_medusa_tokens + 1,
-                                       -1))
-            self.accept_lengths = torch.tensor(best_path_lengths,
-                                               device=self.device)
-            self.new_tokens = torch.nested.to_padded_tensor(
-                torch.nested.nested_tensor(next_main_tokens, dtype=torch.int32),
-                self.end_ids[0])  #FIXME  end id padding.
-            next_medusa_logits = self.filter_medusa_logits(
-                batch_size, best_path, best_path_lengths, medusa_logits)
-            next_medusa_tokens = self.get_next_medusa_tokens(
-                batch_size, next_medusa_logits)
-
-            should_stop = self.early_stop_criteria(batch_size, step,
-                                                   should_stop)
-
-            self.medusa_output_tokens = next_medusa_tokens[:, self.medusa_tree_ids[
-                -self.num_medusa_tokens:]]
-
-        # NOTE: self.accept_lengths are the lengths of accepted tokens in the current step
-        # NOTE: self.sequence_length_buffer = num_past_kv_cache (accepted) + num_medusa_tokens + 1
-        if step == 0:
-            self.update_output_ids_by_offset(self.new_tokens,
-                                             self.sequence_length_buffer)
-        else:
-            # Note：self.sequence_length_buffer = num_past_kv_cache (accepted) + num_medusa_tokens
-            self.update_output_ids_by_offset(
-                self.new_tokens,
-                self.sequence_length_buffer - self.num_medusa_tokens)
-
-        if step != self.max_new_tokens - 1 and not should_stop.item():
-            self.next_medusa_input_ids()
-            if step != 0:
-                assert best_path is not None and best_path_lengths is not None
-                self.update_kv_cache_draft_token_location(
-                    batch_size, best_path, best_path_lengths)
-            else:
-                self.sequence_length_buffer += self.num_medusa_tokens + 1
-
-        # NOTE: set the accepted tokens for the last step.
-        if should_stop.item():
-            # remove num_medusa_tokens for next generation.
-            # Runtime: denotes kv cache length start positions.
-            # Output: denotes the length of sequence length (input ids + output ids)
-            self.sequence_length_buffer = self.sequence_length_buffer + self.accept_lengths - self.num_medusa_tokens
-
-        next_step_buffer['host_past_key_value_lengths'].to_torch().copy_(
-            self.sequence_length_buffer)
-
-        return should_stop
 
     def handle_per_step(
             self, cache_indirections: list, step: int, batch_size: int,
@@ -2150,71 +1384,6 @@ class EmbeddingSession(object):
             torch.cuda.synchronize()
 
         context_logits = None
-        # if self.mapping.is_last_pp_rank():
-        #     if step == 0 and self.gather_context_logits:
-        #         assert not self.is_medusa_mode
-        #         context_logits = self.buffer['logits'].detach().clone()
-        #         # gather last token of context
-        #         if self.remove_input_padding:
-        #             # reshape self.buffer['logits'] from [bs, max_context_length, vocab]
-        #             # to [1, bs * max_context_length, vocab]
-        #             # Note that the data are put in the buffer without padding although
-        #             # the allocated buffer has padding.
-        #             self.buffer['logits'] = self.buffer['logits'].reshape(
-        #                 [1, -1, self.vocab_size_padded])
-        #             self.buffer['logits'] = torch.index_select(
-        #                 self.buffer['logits'], 1,
-        #                 last_token_ids - 1).view(batch_size,
-        #                                          self.vocab_size_padded)
-        #         else:
-        #             last_token_ids = last_token_ids.reshape(batch_size, 1, 1)
-        #             last_token_ids = last_token_ids.expand(
-        #                 batch_size, 1, self.vocab_size_padded) - 1
-        #             self.buffer['logits'] = torch.gather(
-        #                 self.buffer['logits'],
-        #                 dim=1,
-        #                 index=last_token_ids.to(dtype=torch.int64)).view(
-        #                     batch_size, self.vocab_size_padded)
-
-        # if step == 0 and beam_width > 1:
-        #     assert not self.is_medusa_mode
-        #     assert not self.has_rnn_layers
-        #     # these tiled tensors are returned by handle_per_step(), so they can relay to the next generation calls
-        #     if not self.use_gpt_attention_plugin:
-        #         attention_mask = _tile_beam_width(attention_mask, beam_width)
-        #     context_lengths = _tile_beam_width(context_lengths, beam_width)
-        #     host_context_lengths = _tile_beam_width(host_context_lengths,
-        #                                             beam_width)
-        #     if encoder_input_lengths is not None:
-        #         encoder_input_lengths = _tile_beam_width(
-        #             encoder_input_lengths, beam_width)
-
-        #     if tasks is not None:
-        #         tasks = _tile_beam_width(tasks, beam_width)
-
-        #     # Move tiling before logit computing of context
-        #     if not self.paged_kv_cache:
-        #         for key in self.buffer:
-        #             # Note: this tiles both self attn cache and cross attn
-        #             # cache! both names contain "present_key_value"
-        #             if "present_key_value" in key:
-        #                 if self.use_gpt_attention_plugin:
-        #                     self.buffer[key] = _tile_beam_width(
-        #                         self.buffer[key], beam_width)
-        #                 else:
-        #                     # In the OOTB path, KV cache should be contiguously
-        #                     # tiled since TRT engine allocates past_kv cache of
-        #                     # length context_length, i.e., we need a buffer of
-        #                     # shape (batch * beam, 2, heads, context_length, head_size).
-        #                     b, _, h, _, d = self.buffer[key].shape
-        #                     numel = 2 * b * h * (max_context_length + step) * d
-        #                     self.buffer[key] = _contiguous_tile_beam_width(
-        #                         self.buffer[key], numel, beam_width)
-
-        #     if self.mapping.is_last_pp_rank():
-        #         self.buffer['logits'] = _tile_beam_width(
-        #             self.buffer['logits'], beam_width)
-
         generation_logits = None
         # if self.mapping.is_last_pp_rank():
         #     if self.gather_generation_logits:
@@ -2224,139 +1393,10 @@ class EmbeddingSession(object):
         if step == 0:
             self.sequence_length_buffer = context_lengths.detach().clone()
 
-        # # NOTE: handle next step.
-        # if not step == self.max_new_tokens - 1:
-        #     # Set shape and address for the next step
-        #     model_inputs = self._prepare_generation_inputs(
-        #         batch_size=batch_size,
-        #         context_lengths=context_lengths,
-        #         use_gpt_attention_plugin=self.use_gpt_attention_plugin,
-        #         remove_input_padding=self.remove_input_padding,
-        #         step=step,
-        #         num_beams=beam_width,
-        #         attention_mask=attention_mask,
-        #     )
-
-        #     position_ids = model_inputs.get('position_ids', None)
-        #     last_token_ids = model_inputs.get('last_token_ids')
-        #     attention_mask = model_inputs.get('attention_mask', None)
-
-        #     # Prepare for the next step, and always allocate 1 token slot.
-        #     if self.paged_kv_cache and self.has_attn_layers:
-        #         # Iterate to the next step in KV cache manager.
-        #         # Increase number of tokens for all unfinished sequences.
-        #         # And allocate new blocks if needed.
-        #         # We set this to False for all sequences, since we use only length criterion to stop now
-        #         # OPTIMIZE: find a better of adding multiple tokens for paged kv cache.
-        #         if self.is_medusa_mode and self.num_medusa_tokens > 0:
-        #             # Allocate kv cache token slots for next step.
-        #             # Make sure there are always > (num_medusa_tokens + 1) free token slots.
-        #             # Allocate (num_medusa_tokens + 1) * 2 for safety as we don't know the current step or next step's accepted lengths.
-        #             add_token_count = (self.num_medusa_tokens +
-        #                                1) * 2 if step == 0 else torch.max(
-        #                                    self.accept_lengths).item()
-        #             assert add_token_count > 0
-        #             for new_tokens in range(add_token_count):
-        #                 self.kv_cache_manager.step([False] * batch_size)
-        #         else:
-        #             self.kv_cache_manager.step([False] * batch_size)
-        #         host_kv_cache_block_offsets = self.kv_cache_manager.get_block_offsets(
-        #             beam_width)
-        #         kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
-        #         if self.cross_attention:
-        #             host_cross_kv_cache_block_offsets = self.cross_kv_cache_manager.get_block_offsets(
-        #                 beam_width)
-        #             cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets.to(
-        #                 'cuda')
-
-        #     next_context = self.runtime.context_1 if step % 2 else self.runtime.context_0
-        #     next_step_tensors = self._get_next_step_shape_buffer(
-        #         batch_size, beam_width, max_context_length, step,
-        #         context_lengths, host_context_lengths, position_ids,
-        #         last_token_ids, attention_mask, cross_attention_mask,
-        #         next_src_cache_indirection, kv_cache_block_offsets,
-        #         host_kv_cache_block_offsets, cross_kv_cache_block_offsets,
-        #         host_cross_kv_cache_block_offsets, hidden_states,
-        #         prompt_embedding_table, tasks, prompt_vocab_size,
-        #         encoder_output, encoder_input_lengths)
-
-        #     # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object
-        #     # needs to pro-long the life time of the tensors inside the next_step_tensors array
-        #     # otherwise, it maybe released before the next step actually enqueued
-        #     # one way to prolong it is to return the list, and destroy it in next step by assigning new values
-        #     self.runtime._set_tensors(next_context, next_step_tensors)
-
-        #     if self.cuda_graph_mode:
-        #         self._capture_cuda_graph_and_instantiate(
-        #             next_context, stream, step)
-
         should_stop = None
         logits = None
         if self.mapping.is_last_pp_rank():
             should_stop = torch.tensor(True) # TODO(ilyaonoff)
-            # logits = self.buffer['logits']
-            # if logits is not None:
-            #     if self.is_medusa_mode:
-            #         should_stop = self.process_logits_for_medusa_mode(
-            #             step, batch_size, input_ids, logits, False,
-            #             next_step_tensors, context_lengths)
-            #     else:
-            #         if logits_processor is not None:
-            #             final_output_ids = self.finalize_decoder(
-            #                 context_lengths,
-            #                 batch_size,
-            #                 beam_width,
-            #                 scfg,
-            #                 in_progress=True)
-            #             # keep the shape as same as huggingface stopping_criteria
-            #             final_output_ids_ = final_output_ids.reshape(
-            #                 -1, final_output_ids.size(-1))
-            #             logits = logits_processor(step, final_output_ids_,
-            #                                       logits)
-            #             self.buffer['logits'] = logits
-            #         # [batch_size x beam_width, vocab_size_padded] -> [batch_size, beam_width, vocab_size_padded]
-            #         next_token_logits = logits.reshape(
-            #             (batch_size, beam_width,
-            #              -1)).to(self.decoder_logits_dtype)
-            #         decode_step = step + max_context_length
-
-            #         stop_words_list_ptrs, stop_words_lens, max_stop_words_len = stop_words_data
-            #         bad_words_list_ptrs, bad_words_lens, max_bad_words_len = bad_words_data
-
-            #         should_stop = self.dynamic_decoder.forward(
-            #             next_token_logits, decode_step, max_context_length,
-            #             self.max_attention_window_size, self.sink_token_length,
-            #             ite, batch_size, self.end_ids, self.embedding_bias_opt,
-            #             context_lengths, sequence_limit_lengths,
-            #             stop_words_list_ptrs, stop_words_lens,
-            #             max_stop_words_len, bad_words_list_ptrs, bad_words_lens,
-            #             max_bad_words_len, this_src_cache_indirection,
-            #             self.output_ids, self.new_tokens, self.finished,
-            #             self.finished, self.sequence_length_buffer,
-            #             self.cum_log_probs, self.log_probs,
-            #             self.log_probs_tiled, self.parent_ids,
-            #             this_tgt_cache_indirection,
-            #             self.beam_hyps_output_ids_cba,
-            #             self.beam_hyps_seq_len_cba,
-            #             self.beam_hyps_cum_log_probs_cba,
-            #             self.beam_hyps_normed_scores_cba,
-            #             self.beam_hyps_log_probs_cba,
-            #             self.beam_hyps_min_normed_scores,
-            #             self.beam_hyps_num_beams, self.beam_hyps_is_done,
-            #             scfg.use_beam_hyps)
-
-            #         if stopping_criteria is not None and not should_stop.item():
-            #             final_output_ids = self.finalize_decoder(
-            #                 context_lengths,
-            #                 batch_size,
-            #                 beam_width,
-            #                 scfg,
-            #                 in_progress=True)
-            #             # keep the shape as same as huggingface stopping_criteria
-            #             final_output_ids_ = final_output_ids.reshape(
-            #                 -1, final_output_ids.size(-1))
-            #             should_stop[0] = stopping_criteria(
-            #                 step, final_output_ids_, logits)
 
         if self.runtime._is_profiling():
             if not context.report_to_profiler():
@@ -2461,11 +1501,6 @@ class EmbeddingSession(object):
                 outputs['context_logits'] = outputs_context_logits
             if self.gather_generation_logits:
                 outputs['generation_logits'] = outputs_generation_logits
-            if self.is_medusa_mode:
-                outputs['medusa_output_tokens'] = self.medusa_output_tokens
-                outputs['accept_lengths'] = self.accept_lengths
-                if self.medusa_temperature != 0.0:
-                    outputs['medusa_output_logits'] = self.medusa_output_logits
             return outputs
 
         benchmark_profiler = kwargs.get('benchmark_profiler', None)
@@ -2483,83 +1518,61 @@ class EmbeddingSession(object):
                                                     step_count)
 
         next_step_tensors = None
-        for step in range(0, self.max_new_tokens):
+        step = 0
+        should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
+            cache_indirections, step, batch_size, max_context_length,
+            beam_width, input_ids, hidden_states, scfg,
+            kv_cache_block_offsets, host_kv_cache_block_offsets,
+            cross_kv_cache_block_offsets, host_cross_kv_cache_block_offsets,
+            prompt_embedding_table, tasks, context_lengths,
+            host_context_lengths, attention_mask, cross_attention_mask,
+            prompt_vocab_size, ite, sequence_limit_lengths,
+            sequence_lengths, next_step_tensors, stop_words_data,
+            bad_words_data, encoder_output, encoder_input_lengths,
+            stopping_criteria, logits_processor, **kwargs)
 
-            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
-                cache_indirections, step, batch_size, max_context_length,
-                beam_width, input_ids, hidden_states, scfg,
-                kv_cache_block_offsets, host_kv_cache_block_offsets,
-                cross_kv_cache_block_offsets, host_cross_kv_cache_block_offsets,
-                prompt_embedding_table, tasks, context_lengths,
-                host_context_lengths, attention_mask, cross_attention_mask,
-                prompt_vocab_size, ite, sequence_limit_lengths,
-                sequence_lengths, next_step_tensors, stop_words_data,
-                bad_words_data, encoder_output, encoder_input_lengths,
-                stopping_criteria, logits_processor, **kwargs)
-            if step == 0:
-                if benchmark_profiler is not None:
-                    benchmark_profiler.record_cuda_event('first_token')
-            else:
-                generation_phase_step_count = generation_phase_step_count + 1
+        if benchmark_profiler is not None:
+            benchmark_profiler.record_cuda_event('first_token')
 
-            if self.mapping.is_last_pp_rank():
-                if step == 0 and self.gather_context_logits:
-                    outputs_context_logits = context_logits
-                if self.gather_generation_logits:
-                    outputs_generation_logits.append(generation_logits)
+        if self.mapping.is_last_pp_rank():
+            if step == 0 and self.gather_context_logits:
+                outputs_context_logits = context_logits
+            if self.gather_generation_logits:
+                outputs_generation_logits.append(generation_logits)
 
-            if should_stop is not None and should_stop.item():
-                profile_fn(benchmark_profiler, generation_phase_step_count)
-                # if self.is_medusa_mode:
-                #     # just hack away for now
-                #     final_output_ids = self.output_ids.clone().unsqueeze(1)
-                #     final_output_ids = final_output_ids[:, :, :self.
-                #                                         max_seq_length -
-                #                                         self._model_config.
-                #                                         max_medusa_tokens]
-                # else:
-                #     final_output_ids = self.finalize_decoder(
-                #         context_lengths, batch_size, beam_width, scfg)
+        if should_stop is not None and should_stop.item():
+            profile_fn(benchmark_profiler, generation_phase_step_count)
+            # if self.is_medusa_mode:
+            #     # just hack away for now
+            #     final_output_ids = self.output_ids.clone().unsqueeze(1)
+            #     final_output_ids = final_output_ids[:, :, :self.
+            #                                         max_seq_length -
+            #                                         self._model_config.
+            #                                         max_medusa_tokens]
+            # else:
+            #     final_output_ids = self.finalize_decoder(
+            #         context_lengths, batch_size, beam_width, scfg)
 
-                # if self.mapping.is_first_pp_rank():
-                #     if return_dict:
-                #         return get_outputs_dict(final_output_ids)
-                #     else:
-                #         return final_output_ids
-                # elif self.mapping.is_last_pp_rank():
-                #     outputs = {}
-                #     if self.gather_context_logits:
-                #         outputs['context_logits'] = outputs_context_logits
-                #     if self.gather_generation_logits:
-                #         outputs['generation_logits'] = outputs_generation_logits
-                #     return outputs
-                # else:
-                #     return None
-
-        assert not self.is_medusa_mode, "the custom decoder doesn't support medusa."
+            # if self.mapping.is_first_pp_rank():
+            #     if return_dict:
+            #         return get_outputs_dict(final_output_ids)
+            #     else:
+            #         return final_output_ids
+            # elif self.mapping.is_last_pp_rank():
+            #     outputs = {}
+            #     if self.gather_context_logits:
+            #         outputs['context_logits'] = outputs_context_logits
+            #     if self.gather_generation_logits:
+            #         outputs['generation_logits'] = outputs_generation_logits
+            #     return outputs
+            # else:
+            #     return None
 
         profile_fn(benchmark_profiler, generation_phase_step_count)
 
         return {
             'embeddings_output': self.buffer['embeddings_output']
         }
-        
-        # final_output_ids = self.finalize_decoder(context_lengths, batch_size,
-        #                                          beam_width, scfg)
-        # if self.mapping.is_first_pp_rank():
-        #     if return_dict:
-        #         return get_outputs_dict(final_output_ids)
-        #     else:
-        #         return final_output_ids
-        # elif self.mapping.is_last_pp_rank():
-        #     outputs = {}
-        #     if self.gather_context_logits:
-        #         outputs['context_logits'] = outputs_context_logits
-        #     if self.gather_generation_logits:
-        #         outputs['generation_logits'] = outputs_generation_logits
-        #     return outputs
-        # else:
-        #     return None
 
     # def decode_stream(self,
     #                   batch_size: int,
@@ -2805,32 +1818,6 @@ class EmbeddingSession(object):
                         always_share_across_beam=True)
                     # cross attention paged kv cache should always share the context blocks across beams
                     # due to the fact that we are not adding new key/value cache to cross kv in generation
-
-        if self.is_medusa_mode:
-            if self.quant_mode.has_kv_cache_quant():
-                # Since torch does not support fp8 now, using int8 here.
-                kv_cache_type = torch.int8
-            else:
-                kv_cache_type = self.dtype if self.paged_kv_cache else self._tensor_dtype(
-                    f'present_key_value_{self.first_layer}')
-            self.history_max_seq_length = [max_context_length]
-            self.kv_cache_updater = KVCacheUpdater()
-            assert not self.cross_attention
-            assert self.use_gpt_attention_plugin
-
-            if self.paged_kv_cache:
-                self.kv_cache_updater.init_paged_kv_cache(
-                    self.num_layers, self.num_heads_kv, self.head_size,
-                    kv_cache_type, self.kv_cache_manager,
-                    self.buffer[f'host_kv_cache_pool_pointers'])
-            else:
-                past_key_value_list = [
-                    self.buffer[f'present_key_value_{i}']
-                    for i in range(self.first_layer, self.last_layer)
-                ]
-                self.kv_cache_updater.init_linear_kv_cache(
-                    self.num_layers, self.num_heads_kv, self.head_size,
-                    kv_cache_type, past_key_value_list)
 
         stop_words_lens = None
         stop_words_list_ptrs = None
