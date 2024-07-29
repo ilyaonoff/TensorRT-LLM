@@ -23,7 +23,7 @@ from .gemma.model import GemmaForCausalLM
 from .gpt.model import GPTForCausalLM, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
-from .llama.model import LLaMAForCausalLM, LLaMAModel
+from .llama.model import LLaMAForCausalLM, LLaMAModel, LLaMAForTextEmbedding
 from .mamba.model import MambaLMHeadModel
 from .medusa.model import MedusaForCausalLm
 from .modeling_utils import PretrainedConfig, PretrainedModel
@@ -83,7 +83,7 @@ MODEL_MAP = {
     'GPTJForCausalLM': GPTJForCausalLM,
     'MPTForCausalLM': MPTForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
-    'LlamaForCausalLM': LLaMAForCausalLM,
+    'LlamaForCausalLM': LLaMAForTextEmbedding,
     'MistralForCausalLM': LLaMAForCausalLM,
     'MixtralForCausalLM': LLaMAForCausalLM,
     'InternLMForCausalLM': LLaMAForCausalLM,

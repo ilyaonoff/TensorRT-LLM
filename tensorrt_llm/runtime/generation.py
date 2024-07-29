@@ -562,6 +562,7 @@ class GenerationSession(object):
             expected_tensor_names += ['hidden_states_input']
 
         if self.mapping.is_last_pp_rank():
+            expected_tensor_names += ['embeddings_output']
             expected_tensor_names += ['logits']
             if not model_config.gather_context_logits:
                 expected_tensor_names += ['last_token_ids']
@@ -1294,6 +1295,11 @@ class GenerationSession(object):
                     (batch_size, max_context_length, self.vocab_size_padded),
                     dtype=self._tensor_dtype('logits'),
                     device=self.device)
+                self.buffer['embeddings_output'] = torch.empty(
+                    (batch_size, 4096),
+                    dtype=self._tensor_dtype('embeddings_output'),
+                    device=self.device
+                )
 
         if self.cross_attention:
             # use shape info to pass max length info in remove padding mode
@@ -1493,6 +1499,7 @@ class GenerationSession(object):
                     input_ids.shape[0], hidden_size)
 
         if self.mapping.is_last_pp_rank():
+            add_tensor(self.buffer['embeddings_output'], 'embeddings_output')
             add_tensor(self.buffer['logits'], 'logits')
             if self.is_medusa_mode:
                 add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
@@ -1671,6 +1678,7 @@ class GenerationSession(object):
             hidden_states_input = hidden_states_input.resize_(*shape)
 
         if self.mapping.is_last_pp_rank():
+            add_tensor(self.buffer['embeddings_output'], 'embeddings_output')
             add_tensor(self.buffer['logits'], 'logits')
             if self.is_medusa_mode:
                 add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
@@ -2544,7 +2552,7 @@ class GenerationSession(object):
                     for name, tensor in next_step_tensors.items()
                 }
 
-        return should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths
+        return should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths, self.buffer['embeddings_output']
 
     def dump_debug_buffers(self, step: int) -> None:
         if self.debug_tensors_to_save is not None:
@@ -2602,6 +2610,7 @@ class GenerationSession(object):
         attention_mask = None
         outputs_context_logits = None
         outputs_generation_logits = []
+        embeddings_output = None
 
         def get_outputs_dict(output_ids):
             outputs = {}
@@ -2623,6 +2632,7 @@ class GenerationSession(object):
                 outputs['accept_lengths'] = self.accept_lengths
                 if self.medusa_temperature != 0.0:
                     outputs['medusa_output_logits'] = self.medusa_output_logits
+            outputs['embeddings_output'] = embeddings_output
             return outputs
 
         benchmark_profiler = kwargs.get('benchmark_profiler', None)
@@ -2639,7 +2649,7 @@ class GenerationSession(object):
         next_step_tensors = None
         for step in range(0, self.max_new_tokens):
 
-            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
+            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths, embeddings_output = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
                 kv_cache_block_pointers, host_kv_cache_block_pointers,
@@ -2682,6 +2692,7 @@ class GenerationSession(object):
                         outputs['context_logits'] = outputs_context_logits
                     if self.gather_generation_logits:
                         outputs['generation_logits'] = outputs_generation_logits
+                    outputs['embeddings_output'] = embeddings_output
                     return outputs
                 else:
                     return None
@@ -2703,6 +2714,7 @@ class GenerationSession(object):
                 outputs['context_logits'] = outputs_context_logits
             if self.gather_generation_logits:
                 outputs['generation_logits'] = outputs_generation_logits
+            outputs['embeddings_output'] = embeddings_output
             return outputs
         else:
             return None
@@ -3247,6 +3259,7 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         expected_tensor_names = []
         expected_tensor_names += ['input_ids']
         expected_tensor_names += ['logits']
+        expected_tensor_names += ['embeddings_output']
         expected_tensor_names += ['host_request_types']
         expected_tensor_names += ['host_context_lengths']
         expected_tensor_names += ['last_token_ids']
@@ -3286,6 +3299,8 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             self.runtime.engine.get_tensor_name(i)
             for i in range(self.runtime.engine.num_io_tensors)
         ]
+        print('Expected', expected_tensor_names)
+        print('Found', found_tensor_names)
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
             logger.error(
