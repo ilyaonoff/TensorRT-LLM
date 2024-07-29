@@ -31,7 +31,7 @@ from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .grok.model import GrokForCausalLM
 from .llama.config import LLaMAConfig
-from .llama.model import LLaMAForCausalLM, LLaMAModel
+from .llama.model import LLaMAForCausalLM, LLaMAModel, LLaMAForTextEmbedding
 from .mamba.model import MambaForCausalLM
 from .medusa.config import MedusaConfig
 from .medusa.model import MedusaForCausalLm
@@ -91,6 +91,7 @@ __all__ = [
     'CogVLMConfig',
     'CogVLMForCausalLM',
     'SpeculativeDecodingMode',
+    'LLaMAForTextEmbedding'
 ]
 
 MODEL_MAP = {
@@ -106,7 +107,7 @@ MODEL_MAP = {
     'GPTJForCausalLM': GPTJForCausalLM,
     'MPTForCausalLM': MPTForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
-    'LlamaForCausalLM': LLaMAForCausalLM,
+    'LlamaForCausalLM': LLaMAForTextEmbedding,
     'MistralForCausalLM': LLaMAForCausalLM,
     'MixtralForCausalLM': LLaMAForCausalLM,
     'ArcticForCausalLM': LLaMAForCausalLM,

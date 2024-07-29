@@ -9,7 +9,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import LLaMAConfig, LLaMAForCausalLM
+from tensorrt_llm.models import LLaMAConfig, LLaMAForCausalLM, LLaMAForTextEmbedding
 from tensorrt_llm.models.convert_utils import has_safetensors
 from tensorrt_llm.models.llama.convert import (load_hf_llama,
                                                load_weights_from_gptq)
@@ -335,8 +335,11 @@ def convert_and_save_hf(args):
             pp_size=args.pp_size,
             moe_tp_size=args.moe_tp_size,
             moe_ep_size=args.moe_ep_size)
+        
+        # calib_config = load_calibration_config(args.calibration_config)
+
         # TODO: support moe quantization for tp + ep
-        LLaMAForCausalLM.quantize(
+        LLaMAForTextEmbedding.quantize(
             args.model_dir,
             args.output_dir,
             dtype=args.dtype,
@@ -345,6 +348,7 @@ def convert_and_save_hf(args):
             device='cpu' if args.load_model_on_cpu else 'cuda',
             calib_dataset=args.calib_dataset,
             **override_fields)
+            # calib_config=calib_config)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
@@ -364,7 +368,7 @@ def convert_and_save_hf(args):
                               pp_size=args.pp_size,
                               moe_tp_size=args.moe_tp_size,
                               moe_ep_size=args.moe_ep_size)
-            llama = LLaMAForCausalLM.from_hugging_face(
+            llama = LLaMAForTextEmbedding.from_hugging_face(
                 model_dir if hf_model is None else hf_model,
                 args.dtype,
                 mapping=mapping,
@@ -384,7 +388,7 @@ def convert_and_save_gptq(args, rank):
                       tp_size=args.tp_size,
                       rank=rank,
                       pp_size=args.pp_size)
-    config = LLaMAConfig.from_hugging_face(
+    config = LLaMAForTextEmbedding.from_hugging_face(
         args.model_dir,
         args.dtype,
         mapping=mapping,

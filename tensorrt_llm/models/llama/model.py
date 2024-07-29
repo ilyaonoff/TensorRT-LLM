@@ -17,7 +17,7 @@ from typing import Optional, Union
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
-                           non_gated_version, recv, send)
+                           non_gated_version, recv, send, gather_last_token_logits)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
@@ -27,7 +27,8 @@ from ...plugin import init_all_reduce_helper
 from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 from ..convert_utils import has_safetensors
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig, check_share_embedding,
+                              PretrainedConfig, PretrainedModel)
 from .config import LLaMAConfig
 from .convert import (load_hf_llama, load_weights_from_hf_by_shard,
                       load_weights_from_hf_model,
@@ -416,3 +417,216 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
 
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config)
+
+
+class LLaMAForTextEmbedding(PretrainedModel):
+    config_class = LLaMAConfig
+
+    def __init__(self, config: LLaMAConfig):
+        self.check_config(config)
+        super().__init__(config)
+        self.transformer = LLaMAModel(config)
+        self.quant_mode = config.quant_mode
+        self.mapping = config.mapping
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        ''' Create a LLaMAForCausalLM object from give parameters
+        '''
+        import transformers
+
+        load_by_shard = kwargs.pop('load_by_shard', False)
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        config = LLaMAConfig.from_hugging_face(hf_config_or_dir,
+                                               dtype=dtype,
+                                               mapping=mapping,
+                                               quant_config=quant_config,
+                                               **kwargs)
+
+        if use_preloading:
+            assert not load_by_shard
+            weights = load_weights_from_hf_model(hf_model, config)
+        elif load_by_shard:
+            weights = load_weights_from_hf_by_shard(hf_model_dir, config)
+        elif has_safetensors(
+                hf_model_dir) and not config.quant_mode.has_any_quant():
+            weights = load_weights_from_hf_safetensors(hf_model_dir, config)
+        else:
+            hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
+            weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = LLaMAForCausalLM(config)
+        model.load(weights)
+        return model
+
+    def default_plugin_config(self, **kwargs):
+        plugin_config = super().default_plugin_config(**kwargs)
+        if self.quant_mode.is_int4_weight_only_per_group():
+            plugin_config.weight_only_groupwise_quant_matmul_plugin = 'auto'
+        return plugin_config
+
+    @classmethod
+    def from_meta_ckpt(cls,
+                       meta_ckpt_dir: str,
+                       dtype: str = 'auto',
+                       mapping: Optional[Mapping] = None,
+                       quant_config: Optional[QuantConfig] = None,
+                       **kwargs):
+        config = LLaMAConfig.from_meta_ckpt(meta_ckpt_dir,
+                                            dtype=dtype,
+                                            mapping=mapping,
+                                            quant_config=quant_config,
+                                            **kwargs)
+
+        weights = load_weights_from_meta_ckpt(meta_ckpt_dir, config)
+
+        check_share_embedding(weights, config)
+        model = LLaMAForCausalLM(config)
+        model.load(weights)
+        return model
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
+        **kwargs,
+    ):
+        DEFAULT_MODELOPT_FLOW = [
+            QuantAlgo.W4A16_AWQ, QuantAlgo.FP8, QuantAlgo.W8A8_SQ_PER_CHANNEL,
+            QuantAlgo.W4A8_AWQ
+        ]
+        config = LLaMAConfig.from_hugging_face(hf_model_dir,
+                                               dtype=dtype,
+                                               mapping=mapping,
+                                               quant_config=quant_config,
+                                               **kwargs)
+
+        if quant_config.quant_algo in DEFAULT_MODELOPT_FLOW:
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=config.dtype,
+                             mapping=config.mapping,
+                             quant_config=config.quantization,
+                             device=device,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        else:
+            # non-modelopt, the legacy TRT-LLM native quantization algorithm:
+            # sq, int4/int8 weights only, int8 kv cache
+            NATIVE_QUANT_FLOW = [QuantAlgo.W4A16, QuantAlgo.W8A16, None
+                                 ] + W8A8_SQ_PLUGIN_LIST
+            is_valid_native_quant = (quant_config.quant_algo in NATIVE_QUANT_FLOW) and \
+                (quant_config.kv_cache_quant_algo in [QuantAlgo.INT8, None])
+            assert quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None, \
+                "There is no point to call the quantize function if both quant_algo and kv_cache_quant_algo is None"
+            assert is_valid_native_quant, f"Internal error: shall call Modelopt for this quantization {quant_config}"
+
+            from . import convert
+            convert.quantize(hf_model_dir,
+                             output_dir,
+                             config=config,
+                             device=device,
+                             calib_dataset=calib_dataset)
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config)
+
+    def forward(self,
+                input_ids: Tensor,
+                position_ids=None,
+                use_cache=False,
+                last_token_ids=None,
+                attention_mask=None,
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None,
+                prompt_embedding_table: Optional[Tensor] = None,
+                prompt_tasks: Optional[Tensor] = None,
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None,
+                spec_decoding_params=None):
+        kwargs = {
+            'input_ids': input_ids,
+            'position_ids': position_ids,
+            'use_cache': use_cache,
+            'attention_mask': attention_mask,
+            'kv_cache_params': kv_cache_params,
+            'attention_params': attention_params,
+        }
+        if lora_params is not None:
+            kwargs['lora_params'] = lora_params
+        if hidden_states is not None:
+            kwargs['hidden_states'] = hidden_states
+        if prompt_embedding_table is not None:
+            kwargs['prompt_embedding_table'] = prompt_embedding_table
+        if prompt_tasks is not None:
+            kwargs['prompt_tasks'] = prompt_tasks
+        if prompt_vocab_size is not None:
+            kwargs['prompt_vocab_size'] = prompt_vocab_size
+
+        if spec_decoding_params is not None:
+            kwargs['spec_decoding_params'] = spec_decoding_params
+
+        hidden_states = self.transformer.forward(**kwargs)
+
+        if use_cache:
+            hidden_states, presents = hidden_states
+
+        if self.config.mapping.is_last_pp_rank():
+            hidden_states = gather_last_token_logits(
+                hidden_states, last_token_ids,
+                default_net().plugin_config.remove_input_padding)
+
+            embeddings = hidden_states
+            embeddings.mark_output('embeddings_output', self.config.logits_dtype)
+        else:
+            hidden_states.mark_output('hidden_states_output', self.config.dtype)
+
+        if use_cache and not default_net().plugin_config.paged_kv_cache:
+            for i, present in zip(
+                    self.config.mapping.pp_layers(
+                        self.config.num_hidden_layers), presents):
+                present.mark_output(f'present_key_value_{i}',
+                                    self.config.kv_dtype)
+            if self.config.mapping.is_last_pp_rank():
+                return (embeddings, presents, hidden_states)
+            return (hidden_states, presents)
+        else:
+            if self.config.mapping.is_last_pp_rank():
+                return embeddings, hidden_states
+            return hidden_states
+
