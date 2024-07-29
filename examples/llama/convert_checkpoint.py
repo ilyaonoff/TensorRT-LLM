@@ -11,7 +11,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import LLaMAForCausalLM
+from tensorrt_llm.models import LLaMAForCausalLM, LLaMAForTextEmbedding
 from tensorrt_llm.models.llama.weight import load_from_gptq_llama
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo, CalibrationConfig
@@ -388,7 +388,7 @@ def convert_and_save_hf(args):
         
         calib_config = load_calibration_config(args.calibration_config)
 
-        LLaMAForCausalLM.quantize(args.model_dir,
+        LLaMAForTextEmbedding.quantize(args.model_dir,
                                   args.output_dir,
                                   quantization,
                                   dtype=args.dtype,
@@ -406,7 +406,8 @@ def convert_and_save_hf(args):
                               rank=rank,
                               tp_size=args.tp_size,
                               pp_size=args.pp_size)
-            llama = LLaMAForCausalLM.from_hugging_face(
+            LLaMAForTextEmbedding.from_checkpoint()
+            llama = LLaMAForTextEmbedding.from_hugging_face(
                 model_dir,
                 args.dtype,
                 mapping=mapping,
@@ -427,7 +428,7 @@ def convert_and_save_gptq(args, rank):
                       tp_size=args.tp_size,
                       rank=rank,
                       pp_size=args.pp_size)
-    llama = LLaMAForCausalLM.from_hugging_face(
+    llama = LLaMAForTextEmbedding.from_hugging_face(
         args.model_dir,
         args.dtype,
         mapping=mapping,

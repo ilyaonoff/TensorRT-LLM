@@ -22,6 +22,8 @@ import numpy as np
 import tensorrt as trt
 import torch
 
+from tensorrt_llm.runtime.embedding import EmbeddingSession
+
 from .. import profiler
 from .._utils import mpi_world_size
 from ..builder import Engine, get_engine_version
@@ -412,7 +414,7 @@ class ModelRunner(ModelRunnerMixin):
         elif pretrained_config.architecture == 'MambaLMHeadModel':
             session_cls = MambaLMHeadModelGenerationSession
         else:
-            session_cls = GenerationSession
+            session_cls = EmbeddingSession
         engine_buffer = engine.engine
         runtime_mapping = pretrained_config.mapping
 
@@ -506,7 +508,7 @@ class ModelRunner(ModelRunnerMixin):
             elif model_config.model_name == 'qwen':
                 session_cls = QWenForCausalLMGenerationSession
             else:
-                session_cls = GenerationSession
+                session_cls = EmbeddingSession
 
             if medusa_choices is not None:
                 assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
@@ -609,6 +611,101 @@ class ModelRunner(ModelRunnerMixin):
         return self.session.gather_generation_logits
 
     def generate(self,
+                 batch_input_ids: List[torch.Tensor],
+                 sampling_config: Optional[SamplingConfig] = None,
+                 prompt_table_path: Optional[str] = None,
+                 prompt_tasks: Optional[str] = None,
+                 lora_uids: Optional[list] = None,
+                 streaming: bool = False,
+                 stopping_criteria: Optional[StoppingCriteria] = None,
+                 logits_processor: Optional[LogitsProcessor] = None,
+                 medusa_choices: Optional[List[List[int]]] = None,
+                 **kwargs) -> Union[torch.Tensor, dict]:
+        """
+        Generates sequences of token ids.
+        The generation-controlling parameters are set in the sampling_config; it will be set to a default one if not passed.
+        You can override any sampling_config's attributes by passing corresponding parameters.
+
+        Args:
+            batch_input_ids (List[torch.Tensor]):
+                A list of input id tensors. Each tensor is of shape (sequence_length, ).
+            sampling_config (SamplingConfig):
+                The sampling configuration to be used as base parametrization for the generation call.
+                The passed **kwargs matching the sampling_config's attributes will override them.
+                If the sampling_config is not provided, a default will be used.
+            prompt_table_path (str):
+                The file path of prompt table (.npy format, exported by nemo_prompt_convert.py).
+            prompt_tasks (str):
+                The prompt tuning task ids for the input batch, in format of comma-separated list (e.g., 0,3,1,0).
+            lora_uids (list):
+                The uids of LoRA weights for the input batch. Use -1 to disable the LoRA module.
+            streaming (bool):
+                Whether or not to use streaming mode for generation.
+            stopping_criteria (StoppingCriteria):
+                Custom stopping criteria.
+            logits_processor (LogitsProcessor):
+                Custom logits processors.
+            medusa_choices (List[List[int]]):
+                Medusa decoding choices.
+            kwargs (Dict[str, Any]:
+                Ad hoc parametrization of sampling_config.
+                The passed **kwargs matching the sampling_config's attributes will override them.
+        Returns:
+            torch.Tensor or dict:
+                If return_dict=False, the method returns generated output_ids.
+                If return_dict=True, the method returns a dict of output_ids,
+                sequence_lengths (if sampling_config.output_sequence_lengths=True),
+                context_logits and generation_logits (if self.gather_context_logits=True
+                and self.gather_generation_logits=True, respectively).
+        """
+        # Use sampling_config like HF's generation_config
+        if sampling_config is None:
+            sampling_config = SamplingConfig(end_id=None, pad_id=None)
+        else:
+            sampling_config = copy.deepcopy(sampling_config)
+        sampling_config.update(**kwargs)
+        self._check_inputs(batch_input_ids, sampling_config)
+
+        batch_size = len(batch_input_ids)
+        batch_input_ids, input_lengths = self._prepare_inputs(
+            batch_input_ids, sampling_config.pad_id)
+
+        self.session.setup(
+            batch_size=batch_size,
+            max_context_length=input_lengths.max().item(),
+            max_new_tokens=sampling_config.max_new_tokens,
+            beam_width=sampling_config.num_beams,
+            max_attention_window_size=sampling_config.max_attention_window_size,
+            sink_token_length=sampling_config.sink_token_length,
+            lora_manager=self.lora_manager,
+            lora_uids=lora_uids,
+            medusa_choices=medusa_choices)
+
+        batch_input_ids = batch_input_ids.cuda()
+        input_lengths = input_lengths.cuda()
+        ptuning_kwargs = self._prepare_ptuning(prompt_table_path, prompt_tasks,
+                                               batch_size)
+        outputs = self.session.decode(
+            batch_input_ids,
+            input_lengths,
+            sampling_config,
+            stop_words_list=sampling_config.stop_words_list,
+            bad_words_list=sampling_config.bad_words_list,
+            output_sequence_lengths=sampling_config.output_sequence_lengths,
+            return_dict=sampling_config.return_dict,
+            streaming=streaming,
+            stopping_criteria=stopping_criteria,
+            logits_processor=logits_processor,
+            **ptuning_kwargs)
+        if sampling_config.return_dict:
+            if streaming:
+                outputs = (self._prepare_outputs(curr_outputs, input_lengths)
+                           for curr_outputs in outputs)
+            else:
+                outputs = self._prepare_outputs(outputs, input_lengths)
+        return outputs
+
+    def embed(self,
                  batch_input_ids: List[torch.Tensor],
                  sampling_config: Optional[SamplingConfig] = None,
                  prompt_table_path: Optional[str] = None,
