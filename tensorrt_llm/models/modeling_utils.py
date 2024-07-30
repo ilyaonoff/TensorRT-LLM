@@ -591,6 +591,9 @@ class DecoderModelForCausalLM(PretrainedModel):
         self.transformer = transformer
         self.lm_head = lm_head
 
+    def after_hidden_states(self, hidden_states: Tensor):
+        return None
+
     def forward(self,
                 input_ids: Tensor,
                 position_ids=None,
@@ -639,6 +642,8 @@ class DecoderModelForCausalLM(PretrainedModel):
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids,
                 default_net().plugin_config.remove_input_padding)
+            
+            self.after_hidden_states(hidden_states)
 
             # [batch_size, hidden_size] -> [batch_size, vocab_size]
             lm_logits = self.lm_head(hidden_states)

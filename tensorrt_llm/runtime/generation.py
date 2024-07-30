@@ -1296,7 +1296,7 @@ class GenerationSession(object):
                     dtype=self._tensor_dtype('logits'),
                     device=self.device)
                 self.buffer['embeddings_output'] = torch.empty(
-                    (batch_size, 4096),
+                    (batch_size, self.hidden_size),  # TODO(ilyaonoff)
                     dtype=self._tensor_dtype('embeddings_output'),
                     device=self.device
                 )

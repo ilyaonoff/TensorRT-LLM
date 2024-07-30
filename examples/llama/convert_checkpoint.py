@@ -204,12 +204,24 @@ def parse_arguments():
         default=None,
         help='Path to a calibration config'
     )
+    parser.add_argument(
+        '--embeddings',
+        action='store_true',
+        default=False
+    )
 
     args = parser.parse_args()
     # changing the default to be consistent as the cli help said.
     if args.moe_num_experts and args.moe_top_k == 0:
         args.moe_top_k = 1
     return args
+
+
+def get_model_cls(args):
+    if args.embeddings:
+        return LLaMAForTextEmbedding
+    else:
+        return LLaMAForCausalLM
 
 
 def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
@@ -248,6 +260,7 @@ def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
 
 
 def convert_and_save_meta(args, rank):
+    assert not args.embeddings, 'Can convert only from huggingface for now'
     mapping = Mapping(world_size=args.tp_size * args.pp_size,
                       tp_size=args.tp_size,
                       pp_size=args.pp_size,
@@ -388,7 +401,7 @@ def convert_and_save_hf(args):
         
         calib_config = load_calibration_config(args.calibration_config)
 
-        LLaMAForTextEmbedding.quantize(args.model_dir,
+        get_model_cls(args).quantize(args.model_dir,
                                   args.output_dir,
                                   quantization,
                                   dtype=args.dtype,
@@ -406,7 +419,7 @@ def convert_and_save_hf(args):
                               rank=rank,
                               tp_size=args.tp_size,
                               pp_size=args.pp_size)
-            llama = LLaMAForTextEmbedding.from_hugging_face(
+            llama = get_model_cls(args).from_hugging_face(
                 model_dir,
                 args.dtype,
                 mapping=mapping,
@@ -423,11 +436,12 @@ def convert_and_save_hf(args):
 
 
 def convert_and_save_gptq(args, rank):
+    assert not args.embedding, 'Sorry still did not try to convert embeddings model with gptq'
     mapping = Mapping(world_size=args.tp_size * args.pp_size,
                       tp_size=args.tp_size,
                       rank=rank,
                       pp_size=args.pp_size)
-    llama = LLaMAForTextEmbedding.from_hugging_face(
+    llama = get_model_cls(args).from_hugging_face(
         args.model_dir,
         args.dtype,
         mapping=mapping,
