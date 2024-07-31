@@ -31,6 +31,7 @@ from .session import _scoped_stream
 
 
 class EmbeddingSession(object):
+    BEAM_WIDTH = 1
 
     _model_config: ModelConfig
     mapping: Mapping
@@ -68,10 +69,6 @@ class EmbeddingSession(object):
         self.debug_tensors_to_save = debug_tensors_to_save
 
         self.cuda_graph_mode = cuda_graph_mode
-        # TODO: in tensorrt_llm/cpp/tensorrt_llm/thop/dynamicDecodeOp.cpp it's T, can be float or half?
-        self.embedding_bias_opt = None
-        # use one more block in paged kv cache.
-        self.use_one_more_block = False
 
         self.buffer = None
         self.buffer_allocated = False
@@ -330,10 +327,6 @@ class EmbeddingSession(object):
         return self._model_config.gather_context_logits
 
     @property
-    def gather_generation_logits(self):
-        return self._model_config.gather_generation_logits
-
-    @property
     def dtype(self):
         return str_dtype_to_torch(self._model_config.dtype)
 
@@ -405,59 +398,38 @@ class EmbeddingSession(object):
             return str_dtype_to_torch(self._model_config.dtype)
         return str_dtype_to_torch(self._model_config.state_dtype)
 
-    def _capture_cuda_graph_and_instantiate(self, context, stream, step):
-        instance_idx = (step + 1) % 2
-        if not self.has_attn_layers:
-            # Create two cuda graph once.If cuda graph has already existed, skip it.
-            if self.runtime.cuda_graph_instances[instance_idx] is not None:
-                return
-            # WAR for TRT 9.x
-            if not trt_gte_10() and step < 3:
-                return
-        # capture cuda graph
-        CUASSERT(
-            cudart.cudaStreamBeginCapture(
-                stream,
-                cudart.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal))
-        context.execute_async_v3(stream)
-        next_graph = CUASSERT(cudart.cudaStreamEndCapture(stream))[0]
-
-        if self.runtime.cuda_graph_instances[instance_idx] is not None:
-            self.runtime.cuda_graph_instances[
-                instance_idx] = _update_cuda_graph_instance(
-                    self.runtime.cuda_graph_instances[instance_idx], next_graph)
-        else:
-            self.runtime.cuda_graph_instances[instance_idx] = CUASSERT(
-                cudart.cudaGraphInstantiate(next_graph, 0))[0]
-
-        # Pre-upload cuda graph to stream
-        CUASSERT(
-            cudart.cudaGraphUpload(
-                self.runtime.cuda_graph_instances[instance_idx], stream))
-
     def _tensor_dtype(self, name):
         # return torch dtype given tensor name for convenience
         dtype = trt_dtype_to_torch(self.runtime.engine.get_tensor_dtype(name))
         return dtype
+    
+    def _get_num_paged_blocks(self, max_attention_window_size,
+                              sink_token_length, use_one_more_block):
+        bubble_len = 0
+        if sink_token_length % self.tokens_per_block > 0:
+            bubble_len += (self.tokens_per_block -
+                           sink_token_length % self.tokens_per_block)
+        max_blocks_per_seq = math.ceil(
+            (max_attention_window_size + bubble_len) / self.tokens_per_block)
+        if use_one_more_block:
+            max_blocks_per_seq += 1
+        num_blocks = self.batch_size * max_blocks_per_seq
+
+        return num_blocks, max_blocks_per_seq
 
     def setup(self,
               batch_size: int,
               max_context_length: int,
-              max_new_tokens: int,
-              beam_width: int = 1,
               max_attention_window_size: Optional[int] = None,
               sink_token_length: Optional[int] = None,
               encoder_max_input_length: Optional[int] = None,
               lora_manager: LoraManager = None,
-              lora_uids: List[str] = None,
-              medusa_choices: List[List[int]] = None):
+              lora_uids: List[str] = None):
         # Store these params related to buffer size to check against
         # the input shape with the params given in decode()
         self.batch_size = batch_size
         self.max_context_length = max_context_length
-        self.max_new_tokens = max_new_tokens
-        self.max_seq_length = max_context_length + max_new_tokens
-        self.beam_width = beam_width
+        self.max_seq_length = max_context_length
         self.encoder_max_input_length = encoder_max_input_length
         if max_attention_window_size is None:
             self.max_attention_window_size = self.max_seq_length
@@ -512,9 +484,6 @@ class EmbeddingSession(object):
         else:
             assert False, "invalid sink_token_length!"
 
-        self.use_one_more_block = (
-            self.paged_kv_cache and beam_width > 1
-            and self.max_seq_length > self.max_attention_window_size)
         self.lora_manager = lora_manager
 
         self.buffer = {}
@@ -983,7 +952,7 @@ class EmbeddingSession(object):
     def handle_per_step(
             self, cache_indirection: torch.Tensor, batch_size: int,
             max_context_length: int, input_ids: torch.Tensor,
-            hidden_states: torch.Tensor, scfg: SamplingConfig,
+            hidden_states: torch.Tensor, pad_id: int,
             kv_cache_block_offsets: torch.Tensor,
             host_kv_cache_block_offsets: torch.Tensor,
             cross_kv_cache_block_offsets: torch.Tensor,
@@ -1003,8 +972,7 @@ class EmbeddingSession(object):
             remove_input_padding=self.remove_input_padding,
             max_context_length=max_context_length,
             input_ids=input_ids,
-            pad_id=scfg.pad_id,
-            eos_id=scfg.end_id)
+            pad_id=pad_id)
 
         position_ids = model_inputs.get('position_ids', None)
         last_token_ids = model_inputs.get('last_token_ids')
@@ -1122,7 +1090,6 @@ class EmbeddingSession(object):
                        context_lengths: torch.Tensor,
                        host_context_lengths,
                        max_context_length: int,
-                       beam_width: int,
                        cache_indirection: torch.Tensor,
                        input_ids: torch.Tensor,
                        hidden_states: torch.Tensor,
@@ -1140,19 +1107,6 @@ class EmbeddingSession(object):
         cross_kv_cache_block_offsets = None
         host_cross_kv_cache_block_offsets = None
         attention_mask = None
-
-        def get_outputs_dict(output_ids):
-            outputs = {}
-            outputs['output_ids'] = output_ids
-            if scfg.output_log_probs:
-                outputs['log_probs'] = self.log_probs
-            if scfg.output_cum_log_probs:
-                outputs['cum_log_probs'] = self.cum_log_probs
-            if output_sequence_lengths:
-                outputs[
-                    'sequence_lengths'] = self.sequence_length_buffer.reshape(
-                        [batch_size, beam_width])
-            return outputs
 
         benchmark_profiler = kwargs.get('benchmark_profiler', None)
         generation_phase_step_count = 0
@@ -1205,24 +1159,17 @@ class EmbeddingSession(object):
     def decode(self,
                input_ids: torch.Tensor,
                context_lengths: torch.Tensor,
-               sampling_config: SamplingConfig,
+               pad_id: int,
                prompt_embedding_table: torch.Tensor = None,
                tasks: torch.Tensor = None,
                prompt_vocab_size: torch.Tensor = None,
-               stop_words_list=None,
-               bad_words_list=None,
-               streaming: bool = False,
                output_sequence_lengths: bool = False,
                return_dict: bool = False,
                encoder_output: torch.Tensor = None,
                encoder_input_lengths: torch.Tensor = None,
-               stopping_criteria: StoppingCriteria = None,
-               logits_processor: LogitsProcessor = None,
                cross_attention_mask: torch.Tensor = None,
                **kwargs):
-        scfg = sampling_config
         batch_size = context_lengths.size(0)
-        beam_width = scfg.num_beams
         max_context_length = torch.max(context_lengths).item()
         host_context_lengths = context_lengths.cpu()
         assert batch_size == self.batch_size, \
@@ -1231,13 +1178,9 @@ class EmbeddingSession(object):
         assert max_context_length <= self.max_context_length, \
             "Given input length is large then the one used in setup()," \
             "rerun the setup function with the new max_context_length to avoid buffer overflow."
-        assert beam_width == self.beam_width, \
-            "Given beam width is different from the one used in setup()," \
-            "rerun the setup function with the new beam width to avoid buffer overflow."
         assert self.sink_token_length <= torch.min(context_lengths).item(), \
             "Given sink token length is larger than shortest context length," \
             "rerun the setup function with a smaller sink token length."
-        ite = 0  # index of local batches, will always be 0 if pp_size = 1
 
         if self.remove_input_padding and input_ids.dim() == 2:
             assert input_ids.shape[
@@ -1250,7 +1193,7 @@ class EmbeddingSession(object):
         cache_indirection = torch.full(
             (
                 batch_size,
-                beam_width,
+                self.BEAM_WIDTH,
                 self.max_attention_window_size,
             ),
             0,
@@ -1260,8 +1203,7 @@ class EmbeddingSession(object):
 
         hidden_states = None
         if self.mapping.has_pp():
-            max_num_tokens = max(batch_size * beam_width,
-                                 batch_size * self.max_seq_length)
+            max_num_tokens = max(batch_size, batch_size * self.max_seq_length)
             hidden_size = self.hidden_size * self.mapping.tp_size
             hidden_states = torch.zeros((1, max_num_tokens, hidden_size))
 
@@ -1269,7 +1211,7 @@ class EmbeddingSession(object):
         if self.paged_kv_cache and self.has_attn_layers:
             num_blocks, max_blocks_per_seq = self._get_num_paged_blocks(
                 self.max_attention_window_size, self.sink_token_length,
-                self.use_one_more_block)
+                False)
             self.buffer[f'host_kv_cache_pool_pointers'] = torch.tensor(
                 [self.kv_cache_pool.data_ptr(), 0], dtype=torch.int64)
 
@@ -1282,8 +1224,8 @@ class EmbeddingSession(object):
                 max_blocks_per_seq=max_blocks_per_seq,
                 max_attention_window_size=self.max_attention_window_size,
                 sink_token_len=self.sink_token_length,
-                beam_width=beam_width,
-                use_one_more_block=self.use_one_more_block)
+                beam_width=self.BEAM_WIDTH,
+                use_one_more_block=False)
 
             if self.cross_attention:
                 cross_num_blocks, max_cross_blocks_per_seq = self._get_num_paged_blocks(
@@ -1304,7 +1246,7 @@ class EmbeddingSession(object):
                     max_blocks_per_seq=max_cross_blocks_per_seq,
                     max_attention_window_size=self.encoder_max_input_length,
                     sink_token_len=self.sink_token_length,
-                    beam_width=beam_width,
+                    beam_width=self.BEAM_WIDTH,
                     use_one_more_block=False)
 
             # Add sequences to the manager
@@ -1324,8 +1266,8 @@ class EmbeddingSession(object):
                     # due to the fact that we are not adding new key/value cache to cross kv in generation
 
         return self.decode_regular(
-            batch_size, scfg, context_lengths,
-            host_context_lengths, max_context_length, beam_width,
+            batch_size, pad_id, context_lengths,
+            host_context_lengths, max_context_length,
             cache_indirection, input_ids, hidden_states,
             prompt_embedding_table, tasks, prompt_vocab_size,
             output_sequence_lengths, return_dict, encoder_output,
