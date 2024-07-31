@@ -712,9 +712,6 @@ class ModelRunner(ModelRunnerMixin):
                  prompt_tasks: Optional[str] = None,
                  lora_uids: Optional[list] = None,
                  streaming: bool = False,
-                 stopping_criteria: Optional[StoppingCriteria] = None,
-                 logits_processor: Optional[LogitsProcessor] = None,
-                 medusa_choices: Optional[List[List[int]]] = None,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -768,13 +765,10 @@ class ModelRunner(ModelRunnerMixin):
         self.session.setup(
             batch_size=batch_size,
             max_context_length=input_lengths.max().item(),
-            max_new_tokens=sampling_config.max_new_tokens,
-            beam_width=sampling_config.num_beams,
             max_attention_window_size=sampling_config.max_attention_window_size,
             sink_token_length=sampling_config.sink_token_length,
             lora_manager=self.lora_manager,
-            lora_uids=lora_uids,
-            medusa_choices=medusa_choices)
+            lora_uids=lora_uids)
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
@@ -783,14 +777,9 @@ class ModelRunner(ModelRunnerMixin):
         outputs = self.session.decode(
             batch_input_ids,
             input_lengths,
-            sampling_config,
-            stop_words_list=sampling_config.stop_words_list,
-            bad_words_list=sampling_config.bad_words_list,
+            sampling_config.pad_id,
             output_sequence_lengths=sampling_config.output_sequence_lengths,
             return_dict=sampling_config.return_dict,
-            streaming=streaming,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
             **ptuning_kwargs)
         if sampling_config.return_dict:
             if streaming:
