@@ -814,13 +814,12 @@ class ModelRunner(ModelRunnerMixin):
         return outputs
 
     def embed(self,
-                 batch_input_ids: List[torch.Tensor],
-                 sampling_config: Optional[SamplingConfig] = None,
-                 prompt_table_path: Optional[str] = None,
-                 prompt_tasks: Optional[str] = None,
-                 lora_uids: Optional[list] = None,
-                 streaming: bool = False,
-                 **kwargs) -> Union[torch.Tensor, dict]:
+              batch_input_ids: List[torch.Tensor],
+              pad_id: Optional[int],
+              prompt_table_path: Optional[str] = None,
+              prompt_tasks: Optional[str] = None,
+              lora_uids: Optional[list] = None,
+              **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
         The generation-controlling parameters are set in the sampling_config; it will be set to a default one if not passed.
@@ -859,22 +858,23 @@ class ModelRunner(ModelRunnerMixin):
                 and self.gather_generation_logits=True, respectively).
         """
         # Use sampling_config like HF's generation_config
-        if sampling_config is None:
-            sampling_config = SamplingConfig(end_id=None, pad_id=None)
-        else:
-            sampling_config = copy.deepcopy(sampling_config)
-        sampling_config.update(**kwargs)
-        self._check_inputs(batch_input_ids, sampling_config)
+        # if sampling_config is None:
+        #     sampling_config = SamplingConfig(end_id=None, pad_id=None)
+        # else:
+        #     sampling_config = copy.deepcopy(sampling_config)
+        # sampling_config.update(**kwargs)
+        # TODO(ilyaonoff) check_inputs
+        # self._check_inputs(batch_input_ids, sampling_config)
 
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
-            batch_input_ids, sampling_config.pad_id)
+            batch_input_ids, pad_id)
 
         self.session.setup(
             batch_size=batch_size,
             max_context_length=input_lengths.max().item(),
-            max_attention_window_size=sampling_config.max_attention_window_size,
-            sink_token_length=sampling_config.sink_token_length,
+            max_attention_window_size=None,  # TODO(ilyaonoff)
+            sink_token_length=None,  # TODO(ilyaonoff)
             lora_manager=self.lora_manager,
             lora_uids=lora_uids)
 
@@ -885,16 +885,10 @@ class ModelRunner(ModelRunnerMixin):
         outputs = self.session.decode(
             batch_input_ids,
             input_lengths,
-            sampling_config.pad_id,
-            output_sequence_lengths=sampling_config.output_sequence_lengths,
-            return_dict=sampling_config.return_dict,
+            pad_id,
+            # output_sequence_lengths=sampling_config.output_sequence_lengths,
+            # return_dict=sampling_config.return_dict,
             **ptuning_kwargs)
-        if sampling_config.return_dict:
-            if streaming:
-                outputs = (self._prepare_outputs(curr_outputs, input_lengths)
-                           for curr_outputs in outputs)
-            else:
-                outputs = self._prepare_outputs(outputs, input_lengths)
         return outputs
 
     def serialize_engine(self) -> trt.IHostMemory:

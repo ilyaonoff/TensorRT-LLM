@@ -423,7 +423,6 @@ class LLaMAForTextEmbedding(PretrainedModel):
     config_class = LLaMAConfig
 
     def __init__(self, config: LLaMAConfig):
-        self.check_config(config)
         super().__init__(config)
         self.transformer = LLaMAModel(config)
         self.quant_mode = config.quant_mode

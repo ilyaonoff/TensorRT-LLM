@@ -418,26 +418,12 @@ def main(args):
             sink_token_length=args.sink_token_length,
             end_id=end_id,
             pad_id=pad_id,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            num_beams=args.num_beams,
-            length_penalty=args.length_penalty,
-            early_stopping=args.early_stopping,
-            repetition_penalty=args.repetition_penalty,
-            presence_penalty=args.presence_penalty,
-            frequency_penalty=args.frequency_penalty,
-            stop_words_list=stop_words_list,
-            bad_words_list=bad_words_list,
-            output_cum_log_probs=(args.output_cum_log_probs_npy != None),
-            output_log_probs=(args.output_log_probs_npy != None),
             lora_uids=args.lora_task_uids,
             prompt_table_path=args.prompt_table_path,
             prompt_tasks=args.prompt_tasks,
-            streaming=args.streaming,
-            output_sequence_lengths=True,
-            return_dict=True,
-            medusa_choices=args.medusa_choices)
+            # output_sequence_lengths=True,
+            # return_dict=True
+        )
         torch.cuda.synchronize()
 
     print(outputs)
