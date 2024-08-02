@@ -1,10 +1,8 @@
 import copy
-import csv
 import math
-from dataclasses import dataclass, field
 from functools import reduce, wraps
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import tensorrt as trt
@@ -16,18 +14,17 @@ import tensorrt as trt
 from cuda import cudart
 
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
-from tensorrt_llm.runtime.generation import CUASSERT, _Runtime, LogitsProcessor, ModelConfig, RuntimeTensor, SamplingConfig, StoppingCriteria, _prepare_attention_mask, _tile_beam_width, _update_cuda_graph_instance
+from tensorrt_llm.runtime.generation import CUASSERT, _Runtime, ModelConfig, RuntimeTensor, _prepare_attention_mask
 
 from .._ipc_utils import set_peer_access
-from .._utils import (pad_vocab_size, preview_trt_version, str_dtype_to_torch,
+from .._utils import (preview_trt_version, str_dtype_to_torch,
                       torch_to_numpy, trt_dtype_to_torch)
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
 from ..quantization import QuantMode
-from .kv_cache_manager import GenerationSequence, KVCacheManager, KVCacheUpdater
+from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .session import _scoped_stream
-
 
 
 class EmbeddingSession(object):
@@ -308,23 +305,23 @@ class EmbeddingSession(object):
     def use_custom_all_reduce(self):
         return self._model_config.use_custom_all_reduce
 
-    def cuda_stream_guard(func):
-        """Sync external stream and set current stream to the one bound to the session. Reset on exit.
-        """
+    # def cuda_stream_guard(func):
+    #     """Sync external stream and set current stream to the one bound to the session. Reset on exit.
+    #     """
 
-        @wraps(func)
-        def wrapper(self, *args, **kwargs):
-            external_stream = torch.cuda.current_stream()
-            if external_stream != self.stream:
-                external_stream.synchronize()
-                torch.cuda.set_stream(self.stream)
-            ret = func(self, *args, **kwargs)
-            if external_stream != self.stream:
-                self.stream.synchronize()
-                torch.cuda.set_stream(external_stream)
-            return ret
+    #     @wraps(func)
+    #     def wrapper(self, *args, **kwargs):
+    #         external_stream = torch.cuda.current_stream()
+    #         if external_stream != self.stream:
+    #             external_stream.synchronize()
+    #             torch.cuda.set_stream(self.stream)
+    #         ret = func(self, *args, **kwargs)
+    #         if external_stream != self.stream:
+    #             self.stream.synchronize()
+    #             torch.cuda.set_stream(external_stream)
+    #         return ret
 
-        return wrapper
+    #     return wrapper
 
     @property
     def cross_attention(self):
@@ -903,7 +900,7 @@ class EmbeddingSession(object):
 
     def decode_regular(self,
                        batch_size: int,
-                       scfg: SamplingConfig,
+                       pad_id: int,
                        context_lengths: torch.Tensor,
                        host_context_lengths,
                        max_context_length: int,
@@ -936,7 +933,7 @@ class EmbeddingSession(object):
 
         next_step_tensors = None
         next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, encoder_input_lengths = self.handle_per_step(
-            cache_indirection, batch_size, max_context_length, input_ids, hidden_states, scfg,
+            cache_indirection, batch_size, max_context_length, input_ids, hidden_states, pad_id,
             kv_cache_block_pointers, host_kv_cache_block_pointers,
             prompt_embedding_table, tasks, context_lengths,
             host_context_lengths, attention_mask, cross_attention_mask,
@@ -965,7 +962,7 @@ class EmbeddingSession(object):
 
     # As dynamic_decoder uses torch's current stream, we must ensure it runs on the same stream that
     # dynamic_decoder was set up with
-    @cuda_stream_guard
+    # @cuda_stream_guard
     def decode(self,
                input_ids: torch.Tensor,
                context_lengths: torch.Tensor,
