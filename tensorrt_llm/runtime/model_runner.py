@@ -368,7 +368,7 @@ class ModelRunnerMixin:
         else:
             tasks = torch.zeros([batch_size], dtype=torch.int32)
 
-        if isinstance(self.session, GenerationSession):
+        if isinstance(self.session, (GenerationSession, EmbeddingSession)):
             return {
                 'prompt_embedding_table': prompt_table_data.cuda(),
                 'tasks': tasks.cuda(),
@@ -428,7 +428,8 @@ class ModelRunner(ModelRunnerMixin):
                     lora_ckpt_source: str = "hf",
                     medusa_choices: List[List[int]] = None,
                     stream: torch.cuda.Stream = None,
-                    gpu_weights_percent: float = 1) -> 'ModelRunner':
+                    gpu_weights_percent: float = 1,
+                    is_embedding: bool = False) -> 'ModelRunner':
         pretrained_config = engine.config.pretrained_config
         build_config = engine.config.build_config
 
@@ -493,8 +494,10 @@ class ModelRunner(ModelRunnerMixin):
                 'glm', 'chatglm'
         ]:
             session_cls = ChatGLMGenerationSession
-        else:
+        elif is_embedding:
             session_cls = EmbeddingSession
+        else:
+            session_cls = GenerationSession
         engine_buffer = engine.engine
         runtime_mapping = pretrained_config.mapping
 
@@ -541,7 +544,8 @@ class ModelRunner(ModelRunnerMixin):
                  lora_ckpt_source: str = "hf",
                  medusa_choices: List[List[int]] = None,
                  stream: torch.cuda.Stream = None,
-                 gpu_weights_percent: float = 1) -> 'ModelRunner':
+                 gpu_weights_percent: float = 1,
+                 is_embedding: bool = False) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
@@ -592,8 +596,10 @@ class ModelRunner(ModelRunnerMixin):
                 session_cls = ChatGLMGenerationSession
             elif model_config.model_name == 'qwen':
                 session_cls = QWenForCausalLMGenerationSession
-            else:
+            elif is_embedding:
                 session_cls = EmbeddingSession
+            else:
+                session_cls = GenerationSession
 
             if medusa_choices is not None:
                 assert model_config.max_medusa_tokens > 0, \
@@ -641,7 +647,7 @@ class ModelRunner(ModelRunnerMixin):
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
             runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
                                              lora_ckpt_source, medusa_choices,
-                                             stream, gpu_weights_percent)
+                                             stream, gpu_weights_percent, is_embedding)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")

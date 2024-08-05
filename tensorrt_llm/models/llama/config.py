@@ -146,7 +146,7 @@ class LLaMAConfig(PretrainedConfig):
             dtype = 'float16'
 
         return cls(
-            architecture='LlamaForCausalLM',
+            architecture=kwargs.get('architecture', 'LlamaForCausalLM'),
             dtype=dtype,
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,
@@ -207,7 +207,7 @@ class LLaMAConfig(PretrainedConfig):
             dtype = 'float16'
 
         # meta checkpoint don't have vocab_size|hidden_act|rotary_base specified, use same default value as HF
-        return cls(architecture="LlamaForCausalLM",
+        return cls(architecture=kwargs.get('architecture', 'LlamaForCausalLM'),
                    dtype=dtype,
                    num_hidden_layers=meta_config["n_layers"],
                    num_attention_heads=n_head,

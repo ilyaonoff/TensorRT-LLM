@@ -453,6 +453,12 @@ class LLaMAForTextEmbedding(PretrainedModel):
             hf_model_dir = hf_model_or_dir
             hf_config_or_dir = hf_model_or_dir
 
+        kwargs.update(
+            {
+                'architecture': 'LlamaForTextEmbedding'
+            }
+        )
+
         config = LLaMAConfig.from_hugging_face(hf_config_or_dir,
                                                dtype=dtype,
                                                mapping=mapping,
@@ -489,6 +495,13 @@ class LLaMAForTextEmbedding(PretrainedModel):
                        mapping: Optional[Mapping] = None,
                        quant_config: Optional[QuantConfig] = None,
                        **kwargs):
+        
+        kwargs.update(
+            {
+                'architecture': 'LlamaForTextEmbedding'
+            }
+        )
+
         config = LLaMAConfig.from_meta_ckpt(meta_ckpt_dir,
                                             dtype=dtype,
                                             mapping=mapping,

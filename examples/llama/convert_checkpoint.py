@@ -208,12 +208,24 @@ def parse_arguments():
         help=
         'Only save the model config w/o read and converting weights, be careful, this is for debug only'
     )
+    parser.add_argument(
+        '--is_embedding',
+        action='store_true',
+        default=False
+    )
 
     args = parser.parse_args()
     # changing the default to be consistent as the cli help said.
     if args.moe_num_experts and args.moe_top_k == 0:
         args.moe_top_k = 1
     return args
+
+
+def get_model_cls(args):
+    if args.is_embedding:
+        return LLaMAForTextEmbedding
+    else:
+        return LLaMAForCausalLM
 
 
 def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
@@ -251,6 +263,7 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
 
 
 def convert_and_save_meta(args, rank):
+    assert not args.is_embedding, 'Can convert only from huggingface for now'
     mapping = Mapping(world_size=args.tp_size * args.pp_size,
                       tp_size=args.tp_size,
                       pp_size=args.pp_size,
@@ -259,7 +272,7 @@ def convert_and_save_meta(args, rank):
                       rank=rank)
     assert not args_to_quant_config(args).quant_mode.has_any_quant(), \
         "quantization from meta checkpoint or empty model were never supported"
-    llama = LLaMAForCausalLM.from_meta_ckpt(
+    llama = get_model_cls(args).from_meta_ckpt(
         args.meta_ckpt_dir,
         args.dtype,
         mapping=mapping,
@@ -339,7 +352,7 @@ def convert_and_save_hf(args):
         # calib_config = load_calibration_config(args.calibration_config)
 
         # TODO: support moe quantization for tp + ep
-        LLaMAForTextEmbedding.quantize(
+        get_model_cls(args).quantize(
             args.model_dir,
             args.output_dir,
             dtype=args.dtype,
@@ -368,7 +381,7 @@ def convert_and_save_hf(args):
                               pp_size=args.pp_size,
                               moe_tp_size=args.moe_tp_size,
                               moe_ep_size=args.moe_ep_size)
-            llama = LLaMAForTextEmbedding.from_hugging_face(
+            llama = get_model_cls(args).from_hugging_face(
                 model_dir if hf_model is None else hf_model,
                 args.dtype,
                 mapping=mapping,
@@ -384,17 +397,18 @@ def convert_and_save_hf(args):
 
 
 def convert_and_save_gptq(args, rank):
+    assert not args.is_embedding, 'Sorry still did not try to convert embeddings model with gptq'
     mapping = Mapping(world_size=args.tp_size * args.pp_size,
                       tp_size=args.tp_size,
                       rank=rank,
                       pp_size=args.pp_size)
-    config = LLaMAForTextEmbedding.from_hugging_face(
+    config = LLaMAConfig.from_hugging_face(
         args.model_dir,
         args.dtype,
         mapping=mapping,
         quant_config=args_to_quant_config(args),
     )
-    model = LLaMAForCausalLM(config)
+    model = get_model_cls(args)(config)
     weights = load_weights_from_gptq(args.quant_ckpt_path, config)
     model.load(weights)
     model.save_checkpoint(args.output_dir, rank == 0)

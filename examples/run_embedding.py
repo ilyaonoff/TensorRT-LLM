@@ -16,10 +16,14 @@
 import argparse
 import ast
 import csv
+import json
 from pathlib import Path
 
+from tqdm import tqdm
 import numpy as np
+from sklearn.metrics import roc_auc_score
 import torch
+from data.sample_builder import EvaluationSampleBuilder
 from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
                    load_tokenizer, read_model_name, throttle_generator)
 
@@ -36,7 +40,6 @@ if PYTHON_BINDINGS:
 
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--max_output_len', type=int, required=True)
     parser.add_argument(
         '--max_attention_window_size',
         type=int,
@@ -112,19 +115,6 @@ def parse_arguments(args=None):
                         type=int,
                         help="Use beam search if num_beams > 1",
                         default=1)
-    parser.add_argument('--temperature', type=float, default=1.0)
-    parser.add_argument('--top_k', type=int, default=1)
-    parser.add_argument('--top_p', type=float, default=0.0)
-    parser.add_argument('--length_penalty', type=float, default=1.0)
-    parser.add_argument('--repetition_penalty', type=float, default=1.0)
-    parser.add_argument('--presence_penalty', type=float, default=0.0)
-    parser.add_argument('--frequency_penalty', type=float, default=0.0)
-    parser.add_argument('--early_stopping',
-                        type=int,
-                        help='Use early stopping if num_beams > 1'
-                        '1 for early-stopping, 0 for non-early-stopping'
-                        'other values for stopping by length',
-                        default=1)
     parser.add_argument('--debug_mode',
                         default=False,
                         action='store_true',
@@ -185,156 +175,6 @@ def parse_arguments(args=None):
     return parser.parse_args(args=args)
 
 
-def parse_input(tokenizer,
-                input_text=None,
-                prompt_template=None,
-                input_file=None,
-                add_special_tokens=True,
-                max_input_length=923,
-                pad_id=None,
-                num_prepend_vtokens=[],
-                model_name=None,
-                model_version=None):
-    if pad_id is None:
-        pad_id = tokenizer.pad_token_id
-
-    batch_input_ids = []
-    if input_file is None:
-        for curr_text in input_text:
-            if prompt_template is not None:
-                curr_text = prompt_template.format(input_text=curr_text)
-            input_ids = tokenizer.encode(curr_text,
-                                         add_special_tokens=add_special_tokens,
-                                         truncation=True,
-                                         max_length=max_input_length)
-            batch_input_ids.append(input_ids)
-    else:
-        if input_file.endswith('.csv'):
-            with open(input_file, 'r') as csv_file:
-                csv_reader = csv.reader(csv_file, delimiter=',')
-                for line in csv_reader:
-                    input_ids = np.array(line, dtype='int32')
-                    batch_input_ids.append(input_ids[-max_input_length:])
-        elif input_file.endswith('.npy'):
-            inputs = np.load(input_file)
-            for row in inputs:
-                input_ids = row[row != pad_id]
-                batch_input_ids.append(input_ids[-max_input_length:])
-        elif input_file.endswith('.txt'):
-            with open(input_file, 'r', encoding='utf-8',
-                      errors='replace') as txt_file:
-                input_text = txt_file.readlines()
-                batch_input_ids = tokenizer(
-                    input_text,
-                    add_special_tokens=add_special_tokens,
-                    truncation=True,
-                    max_length=max_input_length)["input_ids"]
-        else:
-            print('Input file format not supported.')
-            raise SystemExit
-
-    if num_prepend_vtokens:
-        assert len(num_prepend_vtokens) == len(batch_input_ids)
-        base_vocab_size = tokenizer.vocab_size - len(
-            tokenizer.special_tokens_map.get('additional_special_tokens', []))
-        for i, length in enumerate(num_prepend_vtokens):
-            batch_input_ids[i] = list(
-                range(base_vocab_size,
-                      base_vocab_size + length)) + batch_input_ids[i]
-
-    if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
-        for ids in batch_input_ids:
-            ids.append(tokenizer.sop_token_id)
-
-    batch_input_ids = [
-        torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
-    ]
-    return batch_input_ids
-
-
-def print_output(tokenizer,
-                 output_ids,
-                 input_lengths,
-                 sequence_lengths,
-                 output_csv=None,
-                 output_npy=None,
-                 context_logits=None,
-                 generation_logits=None,
-                 cum_log_probs=None,
-                 log_probs=None,
-                 output_logits_npy=None,
-                 output_cum_log_probs_npy=None,
-                 output_log_probs_npy=None):
-    batch_size, num_beams, _ = output_ids.size()
-    if output_csv is None and output_npy is None:
-        for batch_idx in range(batch_size):
-            inputs = output_ids[batch_idx][0][:input_lengths[batch_idx]].tolist(
-            )
-            input_text = tokenizer.decode(inputs)
-            print(f'Input [Text {batch_idx}]: \"{input_text}\"')
-            for beam in range(num_beams):
-                output_begin = input_lengths[batch_idx]
-                output_end = sequence_lengths[batch_idx][beam]
-                outputs = output_ids[batch_idx][beam][
-                    output_begin:output_end].tolist()
-                output_text = tokenizer.decode(outputs)
-                print(
-                    f'Output [Text {batch_idx} Beam {beam}]: \"{output_text}\"')
-
-    output_ids = output_ids.reshape((-1, output_ids.size(2)))
-
-    if output_csv is not None:
-        output_file = Path(output_csv)
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        outputs = output_ids.tolist()
-        with open(output_file, 'w') as csv_file:
-            writer = csv.writer(csv_file, delimiter=',')
-            writer.writerows(outputs)
-
-    if output_npy is not None:
-        output_file = Path(output_npy)
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        outputs = np.array(output_ids.cpu().contiguous(), dtype='int32')
-        np.save(output_file, outputs)
-
-    # Save context logits
-    if context_logits is not None and output_logits_npy is not None:
-        context_logits = torch.cat(context_logits, axis=0)
-        vocab_size_padded = context_logits.shape[-1]
-        context_logits = context_logits.reshape([1, -1, vocab_size_padded])
-
-        output_context_logits_npy = output_logits_npy.split(
-            '.npy')[0] + "_context"
-        output_context_logits_file = Path(output_context_logits_npy)
-        context_outputs = np.array(
-            context_logits.squeeze(0).cpu().contiguous(),
-            dtype='float32')  # [promptLengthSum, vocabSize]
-        np.save(output_context_logits_file, context_outputs)
-
-    # Save generation logits
-    if generation_logits is not None and output_logits_npy is not None and num_beams == 1:
-        output_generation_logits_npy = output_logits_npy.split(
-            '.npy')[0] + "_generation"
-        output_generation_logits_file = Path(output_generation_logits_npy)
-        generation_outputs = np.array(generation_logits.cpu().contiguous(),
-                                      dtype='float32')
-        np.save(output_generation_logits_file, generation_outputs)
-
-    # Save cum log probs
-    if cum_log_probs is not None and output_cum_log_probs_npy is not None:
-        cum_log_probs_file = Path(output_cum_log_probs_npy)
-        cum_log_probs_outputs = np.array(cum_log_probs.cpu().contiguous(),
-                                         dtype='float32')
-        np.save(cum_log_probs_file, cum_log_probs_outputs)
-
-    # Save cum log probs
-    if log_probs is not None and output_log_probs_npy is not None:
-        log_probs_file = Path(output_log_probs_npy)
-        log_probs_outputs = np.array(log_probs.cpu().contiguous(),
-                                     dtype='float32')
-        np.save(log_probs_file, log_probs_outputs)
-
-
 def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
@@ -351,31 +191,6 @@ def main(args):
     )
     pad_id = tokenizer.eos_token_id
     end_id = tokenizer.eos_token_id
-    # tokenizer, pad_id, end_id = load_tokenizer(
-    #     tokenizer_dir=args.tokenizer_dir,
-    #     vocab_file=args.vocab_file,
-    #     model_name=model_name,
-    #     model_version=model_version,
-    #     tokenizer_type=args.tokenizer_type,
-    # )
-
-    # # An example to stop generation when the model generate " London" on first sentence, " eventually became" on second sentence
-    # stop_words_list = [[" London"], ["eventually became"]]
-    # stop_words_list = tensorrt_llm.runtime.to_word_list_format(stop_words_list, tokenizer)
-    # stop_words_list = torch.Tensor(stop_words_list).to(torch.int32).to("cuda").contiguous()
-    stop_words_list = None
-
-    # # An example to prevent generating " chef" on first sentence, " eventually" and " chef before" on second sentence
-    # bad_words_list = [[" chef"], [" eventually, chef before"]]
-    # bad_words_list = tensorrt_llm.runtime.to_word_list_format(bad_words_list, tokenizer)
-    # bad_words_list = torch.Tensor(bad_words_list).to(torch.int32).to("cuda").contiguous()
-    bad_words_list = None
-
-    prompt_template = None
-    if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
-        prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
-    batch_input_ids = [torch.tensor([1, 7860, 1, 2], dtype=torch.int32)]
-    input_lengths = [x.size(0) for x in batch_input_ids]
 
     if not PYTHON_BINDINGS and not args.use_py_session:
         logger.warning(
@@ -392,7 +207,8 @@ def main(args):
                          lora_dir=args.lora_dir,
                          rank=runtime_rank,
                          debug_mode=args.debug_mode,
-                         lora_ckpt_source=args.lora_ckpt_source)
+                         lora_ckpt_source=args.lora_ckpt_source,
+                         is_embedding=True)
     if args.medusa_choices is not None:
         args.medusa_choices = ast.literal_eval(args.medusa_choices)
         assert args.use_py_session, "Medusa is only supported by py_session"
@@ -401,8 +217,8 @@ def main(args):
         runner_kwargs.update(medusa_choices=args.medusa_choices)
     if not args.use_py_session:
         runner_kwargs.update(
-            max_batch_size=len(batch_input_ids),
-            max_input_len=max(input_lengths),
+            max_batch_size=8,  # TODO(ilyaonoff)
+            max_input_len=8182,  # TODO(ilyaonoff)
             max_output_len=args.max_output_len,
             max_beam_width=args.num_beams,
             max_attention_window_size=args.max_attention_window_size,
@@ -410,23 +226,73 @@ def main(args):
         )
     runner = runner_cls.from_dir(**runner_kwargs)
 
-    with torch.no_grad():
-        outputs = runner.embed(
-            batch_input_ids,
-            max_new_tokens=args.max_output_len,
-            max_attention_window_size=args.max_attention_window_size,
-            sink_token_length=args.sink_token_length,
-            end_id=end_id,
-            pad_id=pad_id,
-            lora_uids=args.lora_task_uids,
-            prompt_table_path=args.prompt_table_path,
-            prompt_tasks=args.prompt_tasks,
-            # output_sequence_lengths=True,
-            # return_dict=True
-        )
-        torch.cuda.synchronize()
+    samples = []
+    with open(args.input_file) as f:
+        for line in f.readlines():
+            sample = json.loads(line.strip())
+            samples.append(sample)
 
-    print(outputs)
+    sample_builder = EvaluationSampleBuilder(tokenizer)
+
+    data = []
+    for sample in samples:
+        data.append(sample_builder(sample))
+
+    with torch.no_grad():
+        all_probs = []
+        all_scores = []
+        all_pred = []
+        all_true = []
+
+        for start_index in tqdm(range(0, len(data), 8)):  # TODO(ilyaonoff)
+            batch_data = data[start_index:min(start_index + 8, len(data))]
+            batch_output = {}
+            for key in ['query_pos_input_ids', 'query_neg_input_ids', 'document_input_ids']:
+                batch_input_ids = [d[key] for d in batch_data]
+
+                outputs = runner.embed(
+                    batch_input_ids,
+                    max_attention_window_size=args.max_attention_window_size,
+                    sink_token_length=args.sink_token_length,
+                    end_id=end_id,
+                    pad_id=pad_id,
+                    lora_uids=None, # ["0"] * len(batch_data),  # TODO(ilyaonoff)
+                    prompt_table_path=args.prompt_table_path,
+                    prompt_tasks=args.prompt_tasks,
+                    # output_sequence_lengths=True,
+                    # return_dict=True
+                )
+                batch_output[key[:-len('_input_ids')]] = torch.nn.functional.normalize(outputs['embeddings_outputs'], dim=1)
+
+            pos_scores = torch.sum(batch_output['document'] * batch_output['query_pos'], dim=1, keepdim=True)
+            neg_scores = torch.sum(batch_output['document'] * batch_output['query_neg'], dim=1, keepdim=True)
+            scores = torch.cat([neg_scores, pos_scores], dim=1)
+
+            batch_probs = torch.nn.functional.softmax(scores, dim=1).cpu().tolist()
+            batch_pred = torch.argmax(scores, dim=1).cpu().tolist()
+            batch_scores = scores.cpu().tolist()
+
+            print(batch_scores, [d['label'] for d in batch_data])
+
+            all_probs.extend(batch_probs)
+            all_scores.extend(batch_scores)
+            all_pred.extend(batch_pred)
+            all_true.extend([d['label'] for d in batch_data])
+
+        all_probs = np.array(all_probs)
+        all_scores = np.array(all_scores)
+        all_pred = np.array(all_pred)
+        all_true = np.array(all_true)
+
+        metrics = {
+            'ROC AUC': roc_auc_score(all_true, all_probs[:, 1]),
+            'ACCURACY': np.sum(all_pred == all_true) / all_true.shape[0]
+        }
+
+        print(metrics)
+        # torch.cuda.synchronize()
+
+    print(outputs['embeddings_outputs'].shape)
 
     # if args.streaming:
     #     for curr_outputs in throttle_generator(outputs,
