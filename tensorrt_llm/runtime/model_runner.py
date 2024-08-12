@@ -888,7 +888,7 @@ class ModelRunner(ModelRunnerMixin):
         input_lengths = input_lengths.cuda()
         ptuning_kwargs = self._prepare_ptuning(prompt_table_path, prompt_tasks,
                                                batch_size)
-        outputs = self.session.decode(
+        outputs = self.session.embed(
             batch_input_ids,
             input_lengths,
             pad_id,

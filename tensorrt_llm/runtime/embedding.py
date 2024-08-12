@@ -2,9 +2,8 @@
 import copy
 import math
 import platform
-from functools import reduce, wraps
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import numpy as np
 import tensorrt as trt
@@ -22,7 +21,7 @@ from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
 from ..plugin.plugin import CustomAllReduceHelper
-from tensorrt_llm.runtime.generation import CUASSERT, _Runtime, LogitsProcessor, ModelConfig, RuntimeTensor, SamplingConfig, StoppingCriteria, _prepare_attention_mask, _tile_beam_width, _update_cuda_graph_instance
+from tensorrt_llm.runtime.generation import CUASSERT, _Runtime, ModelConfig, RuntimeTensor, _prepare_attention_mask
 
 from ..quantization import QuantMode
 from .kv_cache_manager import GenerationSequence, KVCacheManager
@@ -235,8 +234,6 @@ class EmbeddingSession(object):
             self.runtime.engine.get_tensor_name(i)
             for i in range(self.runtime.engine.num_io_tensors)
         ]
-        print(expected_tensor_names)
-        print(found_tensor_names)
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
             logger.error(
@@ -959,8 +956,7 @@ class EmbeddingSession(object):
             prompt_embedding_table: torch.Tensor, tasks: torch.Tensor,
             context_lengths: torch.Tensor, host_context_lengths,
             attention_mask: torch.Tensor, cross_attention_mask: torch.Tensor,
-            prompt_vocab_size: torch.Tensor,
-            next_step_tensors: Dict[str, RuntimeTensor], encoder_output: torch.Tensor,
+            prompt_vocab_size: torch.Tensor, encoder_output: torch.Tensor,
             encoder_input_lengths: torch.Tensor):
 
         model_inputs = self._prepare_context_inputs(
@@ -1051,13 +1047,7 @@ class EmbeddingSession(object):
         if self.debug_mode:
             self.dump_debug_buffers()
 
-            if next_step_tensors is not None:
-                self.debug_buffer = {
-                    name: tensor.to_torch()
-                    for name, tensor in next_step_tensors.items()
-                }
-
-        return next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, encoder_input_lengths
+        return tasks, context_lengths, host_context_lengths, attention_mask, encoder_input_lengths
 
     def dump_debug_buffers(self) -> None:
         if self.debug_tensors_to_save is not None:
@@ -1083,24 +1073,24 @@ class EmbeddingSession(object):
                 t.reshape(-1, t.shape[-1]),  # savetxt accepts 2 dims only
                 fmt=txt_format)
 
-    def decode_regular(self,
-                       batch_size: int,
-                       pad_id: int,
-                       context_lengths: torch.Tensor,
-                       host_context_lengths,
-                       max_context_length: int,
-                       cache_indirection: torch.Tensor,
-                       input_ids: torch.Tensor,
-                       hidden_states: torch.Tensor,
-                       prompt_embedding_table: torch.Tensor,
-                       tasks: torch.Tensor,
-                       prompt_vocab_size: torch.Tensor,
-                       output_sequence_lengths: bool = False,
-                       return_dict: bool = False,
-                       encoder_output: torch.Tensor = None,
-                       encoder_input_lengths: torch.Tensor = None,
-                       cross_attention_mask: torch.Tensor = None,
-                       **kwargs):
+    def embed_regular(self,
+                      batch_size: int,
+                      pad_id: int,
+                      context_lengths: torch.Tensor,
+                      host_context_lengths,
+                      max_context_length: int,
+                      cache_indirection: torch.Tensor,
+                      input_ids: torch.Tensor,
+                      hidden_states: torch.Tensor,
+                      prompt_embedding_table: torch.Tensor,
+                      tasks: torch.Tensor,
+                      prompt_vocab_size: torch.Tensor,
+                      output_sequence_lengths: bool = False,
+                      return_dict: bool = False,
+                      encoder_output: torch.Tensor = None,
+                      encoder_input_lengths: torch.Tensor = None,
+                      cross_attention_mask: torch.Tensor = None,
+                      **kwargs):
         kv_cache_block_offsets = None
         host_kv_cache_block_offsets = None
         cross_kv_cache_block_offsets = None
@@ -1121,15 +1111,14 @@ class EmbeddingSession(object):
                 benchmark_profiler_obj.add_aux_info('generation_step_count',
                                                     step_count)
 
-        next_step_tensors = None
-        next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, encoder_input_lengths = self.handle_per_step(
+        tasks, context_lengths, host_context_lengths, attention_mask, encoder_input_lengths = self.handle_per_step(
             cache_indirection, batch_size, max_context_length,
             input_ids, hidden_states, pad_id,
             kv_cache_block_offsets, host_kv_cache_block_offsets,
             cross_kv_cache_block_offsets, host_cross_kv_cache_block_offsets,
             prompt_embedding_table, tasks, context_lengths,
             host_context_lengths, attention_mask, cross_attention_mask,
-            prompt_vocab_size, next_step_tensors, encoder_output, encoder_input_lengths)
+            prompt_vocab_size, encoder_output, encoder_input_lengths)
 
         if benchmark_profiler is not None:
             benchmark_profiler.record_cuda_event('first_token')
@@ -1155,19 +1144,19 @@ class EmbeddingSession(object):
     # As dynamic_decoder uses torch's current stream, we must ensure it runs on the same stream that
     # dynamic_decoder was set up with
     # @cuda_stream_guard
-    def decode(self,
-               input_ids: torch.Tensor,
-               context_lengths: torch.Tensor,
-               pad_id: int,
-               prompt_embedding_table: torch.Tensor = None,
-               tasks: torch.Tensor = None,
-               prompt_vocab_size: torch.Tensor = None,
-               output_sequence_lengths: bool = False,
-               return_dict: bool = False,
-               encoder_output: torch.Tensor = None,
-               encoder_input_lengths: torch.Tensor = None,
-               cross_attention_mask: torch.Tensor = None,
-               **kwargs):
+    def embed(self,
+              input_ids: torch.Tensor,
+              context_lengths: torch.Tensor,
+              pad_id: int,
+              prompt_embedding_table: torch.Tensor = None,
+              tasks: torch.Tensor = None,
+              prompt_vocab_size: torch.Tensor = None,
+              output_sequence_lengths: bool = False,
+              return_dict: bool = False,
+              encoder_output: torch.Tensor = None,
+              encoder_input_lengths: torch.Tensor = None,
+              cross_attention_mask: torch.Tensor = None,
+              **kwargs):
         batch_size = context_lengths.size(0)
         max_context_length = torch.max(context_lengths).item()
         host_context_lengths = context_lengths.cpu()
@@ -1264,7 +1253,7 @@ class EmbeddingSession(object):
                     # cross attention paged kv cache should always share the context blocks across beams
                     # due to the fact that we are not adding new key/value cache to cross kv in generation
 
-        return self.decode_regular(
+        return self.embed_regular(
             batch_size, pad_id, context_lengths,
             host_context_lengths, max_context_length,
             cache_indirection, input_ids, hidden_states,
