@@ -16,8 +16,8 @@ from typing import Optional, Union
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
-                           non_gated_version, recv, send, gather_last_token_logits)
+from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor, cast,
+                           non_gated_version, recv, send, gather_last_token_logits, avg_pool1d, l_norm)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
@@ -478,7 +478,7 @@ class LLaMAForTextEmbedding(PretrainedModel):
             weights = load_weights_from_hf_model(hf_model, config)
 
         check_share_embedding(weights, config)
-        model = LLaMAForCausalLM(config)
+        model = LLaMAForTextEmbedding(config)
         model.load(weights)
         return model
 
@@ -511,7 +511,7 @@ class LLaMAForTextEmbedding(PretrainedModel):
         weights = load_weights_from_meta_ckpt(meta_ckpt_dir, config)
 
         check_share_embedding(weights, config)
-        model = LLaMAForCausalLM(config)
+        model = LLaMAForTextEmbedding(config)
         model.load(weights)
         return model
 
@@ -624,6 +624,9 @@ class LLaMAForTextEmbedding(PretrainedModel):
                 default_net().plugin_config.remove_input_padding)
 
             embeddings = hidden_states
+            embeddings = avg_pool1d(embeddings, 4)  # TODO(ilyaonoff) move it to config
+            embeddings = l_norm(embeddings, dim=-1, p=2)  # TODO(ilyaonoff) move it to config
+            embeddings = embeddings.cast(self.config.logits_dtype)  # TODO(ilyaonoff) is it ok?
             embeddings.mark_output('embeddings_output', self.config.logits_dtype)
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)

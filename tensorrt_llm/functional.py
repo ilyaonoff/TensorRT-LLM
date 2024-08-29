@@ -3351,6 +3351,37 @@ def avg_pool2d(input: Tensor,
     return output
 
 
+def avg_pool1d(input: Tensor,
+               kernel_size: int) -> Tensor:
+    '''
+    Running average pooling over the last dimension
+
+    Parameters:
+        input : Tensor
+            Input TensorRT-LLM Tensor. Currently expecting only tensor with shape [batch_size, dim]
+        kernel_size : int
+            Kernel size for pooling
+
+    Returns:
+        The output tensor created by that layer. 
+    '''
+
+    assert not input.is_dynamic()
+    ndim = input.ndim()
+    assert ndim == 2
+    
+    input = expand_dims(input, (0, 1))
+
+    layer = default_trtnet().add_pooling_nd(input.trt_tensor,
+                                            trt.PoolingType.AVERAGE,
+                                            (1, kernel_size))
+    layer.stride_nd = (1, kernel_size)
+
+    output = _create_tensor(layer.get_output(0), layer)
+    output = output.view(concat([output.size(2), output.size(3)]))
+    return output
+
+
 def conv1d(input: Tensor,
            weight: Tensor,
            bias: Optional[Tensor] = None,
@@ -5111,6 +5142,41 @@ def rms_norm(input: Tensor,
 
     if weight is not None:
         y = y * weight
+
+    return y
+
+
+def l_norm(input: Tensor,
+           dim: int,
+           p: float,
+           eps: float = 1e-06) -> Tensor:
+    '''
+    Normalizing by l_p norm
+
+    Parameters:
+        input : Tensor
+            Input TensorRT-LLM Tensor
+        dim:
+            Dimension to run normalization over
+        p:
+            p paramter of L_p normalization
+        eps : float
+            The epsilon term to be added to the vector norms
+
+    Returns:
+        The output tensor of that operation.
+    '''
+
+    with precision("float32"):
+        input_dtype = input.dtype
+        fp32_input = cast(input, "float32")
+        squares = pow(fp32_input, p)
+
+        squares_sum = sum(squares, dim=dim, keepdim=True)
+        denom = squares_sum + eps
+        denom = denom.sqrt()
+        fp32_y = fp32_input / denom
+        y = cast(fp32_y, input_dtype)
 
     return y
 
